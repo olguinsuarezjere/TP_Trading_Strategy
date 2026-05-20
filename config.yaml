@@ -1,0 +1,24 @@
+strategy:
+  lookback_months: 12
+  target_volatility: 0.10
+  rebalancing: monthly
+  max_position_weight: 0.15
+  vol_com_months: 3
+
+transaction_costs:
+  bid_ask_spread: 0.001
+  commission_pct: 0.0005
+
+backtest:
+  start_date: "2015-01-01"
+  end_date: "2024-12-31"
+  initial_capital: 1_000_000
+
+data:
+  path: "Data/etf_prices.parquet"
+  yfinance_update: false
+
+broker:
+  host: "127.0.0.1"
+  port: 7497
+  client_id: 1
