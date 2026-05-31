@@ -8,6 +8,13 @@ from ib_insync import Stock, MarketOrder, LimitOrder
 
 from .ibkr import IBKRConnection
 
+
+def _yf_price(ticker: str) -> float:
+    import yfinance as yf
+    info = yf.Ticker(ticker).fast_info
+    price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+    return float(price) if price else 100.0
+
 TRADES_LOG = os.path.join(os.path.dirname(__file__), "..", "..", "logs", "trades.csv")
 LOG_HEADER = ["timestamp", "ticker", "action", "qty", "order_type", "limit_price", "status"]
 
@@ -78,7 +85,7 @@ def execute_rebalance(
     capital: valor total del portafolio en USD
     dry_run: si True, solo muestra las órdenes sin ejecutarlas
     """
-    positions_df = conn.get_positions() if not dry_run else pd.DataFrame(
+    positions_df = conn.get_positions() if (not dry_run and conn is not None) else pd.DataFrame(
         columns=["ticker", "qty", "market_price", "market_value"]
     )
 
@@ -103,9 +110,9 @@ def execute_rebalance(
         # Obtener precio si no lo tenemos
         if ticker not in prices:
             try:
-                prices[ticker] = conn.get_market_price(ticker) if not dry_run else 100.0
+                prices[ticker] = conn.get_market_price(ticker) if not dry_run else _yf_price(ticker)
             except Exception:
-                prices[ticker] = 100.0
+                prices[ticker] = _yf_price(ticker) if dry_run else 100.0
 
         price = prices[ticker]
         if price == 0:

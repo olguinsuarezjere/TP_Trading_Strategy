@@ -1,3 +1,7 @@
+# ---------------------------------------------
+# Codigo estrategia + IBKR
+# ---------------------------------------------
+
 import subprocess
 import sys
 
@@ -9,6 +13,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 import yaml
 import click
 
+from src.broker.ibkr import IBKRConnection
+from src.broker.orders import execute_rebalance
+from src.broker.monitor import stream_portfolio_updates
+from src.strategy.portfolio import build_portfolio
 from src.data.loader import load_returns, update_prices
 from src.data.universe import ETF_UNIVERSE
 from src.backtest.engine import BacktestEngine
@@ -139,6 +147,40 @@ def robustness(ctx, test):
 
 
 # ---------------------------------------------
+# test-connection
+# ---------------------------------------------
+@cli.command("test-connection")
+@click.pass_context
+def test_connection(ctx):
+    """Verifica la conexión con IBKR TWS sin ejecutar órdenes."""
+    config = _load_config(ctx.obj["config_path"])
+    broker = config["broker"]
+
+    click.echo(f"Conectando a IBKR TWS en {broker['host']}:{broker['port']} ...")
+    conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+    try:
+        conn.connect()
+
+        click.secho("\n[1] Resumen de cuenta:", bold=True)
+        account = conn.get_account_summary()
+        for key, value in account.items():
+            click.echo(f"    {key:<25} ${value:>14,.2f}")
+
+        click.secho("\n[2] Posiciones actuales:", bold=True)
+        positions = conn.get_positions()
+        if positions.empty:
+            click.echo("    Sin posiciones abiertas.")
+        else:
+            click.echo(positions.to_string(index=False))
+
+        click.secho("\nConexion OK — todo funciona correctamente.", fg="green")
+    except Exception as e:
+        click.secho(f"\nError de conexion: {e}", fg="red")
+    finally:
+        conn.disconnect()
+
+
+# ---------------------------------------------
 # monitor
 # ---------------------------------------------
 @cli.command("monitor")
@@ -146,9 +188,6 @@ def robustness(ctx, test):
 @click.pass_context
 def monitor(ctx, interval):
     """Muestra el portafolio live conectándose a IBKR TWS."""
-    from src.broker.ibkr import IBKRConnection
-    from src.broker.monitor import stream_portfolio_updates
-
     config = _load_config(ctx.obj["config_path"])
     broker = config["broker"]
 
@@ -170,14 +209,9 @@ def monitor(ctx, interval):
 @click.pass_context
 def execute(ctx, dry_run):
     """Calcula el rebalanceo y ejecuta las órdenes en IBKR (o simula con --dry-run)."""
-    from src.broker.ibkr import IBKRConnection
-    from src.broker.orders import execute_rebalance
-
     config = _load_config(ctx.obj["config_path"])
     returns = load_returns(config)
 
-    # Calcular pesos target para el mes actual
-    from src.strategy.portfolio import build_portfolio
     weights, _ = build_portfolio(returns, config)
     target_weights = weights.iloc[-1].dropna()
     target_weights = target_weights[target_weights != 0]

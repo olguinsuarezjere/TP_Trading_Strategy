@@ -261,54 +261,108 @@ elif page == "3. Robustness":
 # --- Página 4: Live Portfolio ------------------------------------------------
 
 elif page == "4. Live Portfolio":
-    st.title("Live Portfolio — IBKR Paper Trading")
+    import time as _time
 
+    st.title("Live Portfolio — IBKR Paper Trading")
     st.info("Requiere que IBKR TWS esté corriendo con API activada (puerto 7497).")
 
-    if st.button("🔄 Conectar y actualizar"):
+    # Auto-refresh controls
+    col_btn, col_auto, col_interval = st.columns([1, 1, 1])
+    refresh_now   = col_btn.button("🔄 Conectar y actualizar")
+    auto_refresh  = col_auto.toggle("Auto-refresh", value=False)
+    interval_secs = col_interval.number_input("Intervalo (seg)", min_value=10, max_value=300,
+                                               value=30, step=10, disabled=not auto_refresh)
+
+    def _show_portfolio():
+        from src.broker.ibkr import IBKRConnection
+        from src.broker.monitor import get_live_portfolio, compute_live_pnl
+
+        broker = config["broker"]
+        conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+        conn.connect()
+
+        portfolio_df = get_live_portfolio(conn)
+        account      = conn.get_account_summary()
+        pnl          = compute_live_pnl(portfolio_df)
+        conn.disconnect()
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Net Liquidation", f"${account.get('NetLiquidation', 0):,.0f}")
+        col2.metric("Cash",            f"${account.get('TotalCashValue', 0):,.0f}")
+        col3.metric("Unrealized P&L",  f"${pnl.get('total_unrealized_pnl', 0):,.0f}")
+        col4.metric("Posiciones",      f"{pnl.get('n_positions', 0)}")
+
+        if not portfolio_df.empty:
+            st.subheader("Posiciones abiertas")
+            portfolio_df["asset_class"] = portfolio_df["ticker"].map(ETF_UNIVERSE)
+            ac_exposure = portfolio_df.groupby("asset_class")["market_value"].sum()
+            fig_pie = px.pie(ac_exposure.reset_index(), values="market_value",
+                             names="asset_class", title="Exposición por Asset Class")
+            col_pie, col_tbl = st.columns([1, 2])
+            col_pie.plotly_chart(fig_pie, use_container_width=True)
+            col_tbl.dataframe(
+                portfolio_df[["ticker", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
+                .sort_values("market_value", ascending=False)
+                .style.format({"weight": "{:.1%}", "market_value": "${:,.0f}",
+                               "unrealized_pnl": "${:,.0f}"}),
+                use_container_width=True,
+            )
+        else:
+            st.warning("Sin posiciones abiertas en la cuenta paper.")
+
+        return account
+
+    if refresh_now or auto_refresh:
         try:
-            from src.broker.ibkr import IBKRConnection
-            from src.broker.monitor import get_live_portfolio, compute_live_pnl
+            account = _show_portfolio()
 
-            broker = config["broker"]
-            conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
-            conn.connect()
+            # --- Sección de Ejecución ---
+            st.divider()
+            st.subheader("Ejecutar Rebalanceo TSMOM")
 
-            portfolio_df = get_live_portfolio(conn)
-            account = conn.get_account_summary()
-            pnl = compute_live_pnl(portfolio_df)
-            conn.disconnect()
+            returns = _load_returns(config_str)
+            weights_df, _ = build_portfolio(returns, config)
+            target_weights = weights_df.iloc[-1].dropna()
+            target_weights = target_weights[target_weights != 0]
 
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Net Liquidation",  f"${account.get('NetLiquidation', 0):,.0f}")
-            col2.metric("Cash",             f"${account.get('TotalCashValue', 0):,.0f}")
-            col3.metric("Unrealized P&L",   f"${pnl.get('total_unrealized_pnl', 0):,.0f}")
-            col4.metric("Posiciones",       f"{pnl.get('n_positions', 0)}")
+            col_dry, col_exec = st.columns(2)
 
-            if not portfolio_df.empty:
-                st.subheader("Posiciones abiertas")
-                # Exposición por asset class
-                portfolio_df["asset_class"] = portfolio_df["ticker"].map(ETF_UNIVERSE)
-                ac_exposure = portfolio_df.groupby("asset_class")["market_value"].sum()
-                fig_pie = px.pie(ac_exposure.reset_index(), values="market_value",
-                                 names="asset_class", title="Exposición por Asset Class")
-                col_pie, col_tbl = st.columns([1, 2])
-                col_pie.plotly_chart(fig_pie, use_container_width=True)
-                col_tbl.dataframe(
-                    portfolio_df[["ticker", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
-                    .sort_values("market_value", ascending=False)
-                    .style.format({"weight": "{:.1%}", "market_value": "${:,.0f}", "unrealized_pnl": "${:,.0f}"}),
-                    use_container_width=True,
+            if col_dry.button("🔍 Dry Run — Ver órdenes"):
+                from src.broker.orders import execute_rebalance
+                st.session_state["dry_run_orders"] = execute_rebalance(
+                    None, target_weights, capital=1_000_000, dry_run=True
                 )
-            else:
-                st.warning("Sin posiciones abiertas en la cuenta paper.")
+
+            if "dry_run_orders" in st.session_state and st.session_state["dry_run_orders"]:
+                orders_df = pd.DataFrame(st.session_state["dry_run_orders"])
+                st.dataframe(orders_df, use_container_width=True, hide_index=True)
+
+            st.warning("⚠️ El botón de abajo ejecuta órdenes REALES en tu cuenta paper.")
+            if col_exec.button("🚀 Ejecutar en IBKR", type="primary"):
+                from src.broker.ibkr import IBKRConnection
+                from src.broker.orders import execute_rebalance
+                broker = config["broker"]
+                conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+                try:
+                    conn.connect()
+                    capital = conn.get_account_summary().get("NetLiquidation", 1_000_000)
+                    execute_rebalance(conn, target_weights, capital=capital, dry_run=False)
+                    st.success(f"Rebalanceo ejecutado. Capital: ${capital:,.0f}")
+                    st.session_state.pop("dry_run_orders", None)
+                finally:
+                    conn.disconnect()
+
         except Exception as e:
             st.error(f"Error al conectar con IBKR TWS: {e}")
             st.info("Verificá que TWS esté abierto y la API esté habilitada en puerto 7497.")
+
+        if auto_refresh:
+            _time.sleep(interval_secs)
+            st.rerun()
     else:
         st.markdown("""
         **Cómo activar la API en TWS:**
-        1. Abrir TWS -> Edit -> Global Configuration -> API -> Settings
+        1. Abrir TWS → Edit → Global Configuration → API → Settings
         2. ✅ Enable ActiveX and Socket Clients
         3. Puerto: **7497** (paper) — **7496** (real)
         4. Agregar `127.0.0.1` en Trusted IPs
