@@ -7,6 +7,25 @@ from .costs import compute_transaction_costs
 from .metrics import performance_report
 
 
+def apply_portfolio_vol_scaling(
+    weights: pd.DataFrame,
+    returns: pd.DataFrame,
+    target_portfolio_vol: float = 0.07,
+    com_months: float = 3.0,
+    max_leverage: float = 2.0,
+) -> pd.DataFrame:
+    """
+    Moreira & Muir (2017): Volatility-Managed Portfolios.
+    scaling_t = clip(target_portfolio_vol / ewma_port_vol_{t-1}, 0, max_leverage)
+    """
+    portfolio_ret = (weights * returns).sum(axis=1)
+    ewma_var = (portfolio_ret ** 2).ewm(com=com_months, min_periods=1).mean()
+    ewma_vol = np.sqrt(ewma_var * 12)
+    scaling  = (target_portfolio_vol / ewma_vol.shift(1).replace(0, np.nan)).clip(upper=max_leverage)
+    scaling  = scaling.fillna(1.0)
+    return weights.mul(scaling, axis=0)
+
+
 @dataclass
 class BacktestResults:
     portfolio_returns: pd.Series
@@ -31,11 +50,21 @@ class BacktestEngine:
     def run(self, returns: pd.DataFrame, use_signal_strength: bool = False) -> BacktestResults:
         weights, signal = build_portfolio(returns, self.config, use_signal_strength)
 
+        # Moreira & Muir (2017): portfolio-level vol scaling
+        if self.config["strategy"].get("use_portfolio_vol_scaling", False):
+            weights = apply_portfolio_vol_scaling(
+                weights,
+                returns,
+                target_portfolio_vol=self.config["strategy"].get("target_portfolio_vol", 0.07),
+                com_months=self.config["strategy"]["vol_com_months"],
+            )
+            from ..strategy.portfolio import apply_position_constraints
+            weights = apply_position_constraints(weights, self.config["strategy"]["max_position_weight"])
+
         # Gross portfolio return: sum of (weight_{t-1} * return_t)
-        # Weights are already lagged inside build_portfolio (signal uses .shift(1))
         gross_returns = (weights * returns).sum(axis=1)
 
-        # Transaction costs
+        # Transaction costs — sobre weights finales (scaled + clipped)
         tc_config = self.config["transaction_costs"]
         costs = compute_transaction_costs(
             weights,
@@ -47,11 +76,11 @@ class BacktestEngine:
 
         # Drop leading NaN rows (warm-up period for signals)
         first_valid = net_returns.first_valid_index()
-        net_returns = net_returns.loc[first_valid:]
+        net_returns   = net_returns.loc[first_valid:]
         gross_returns = gross_returns.loc[first_valid:]
-        costs = costs.loc[first_valid:]
-        weights = weights.loc[first_valid:]
-        signal = signal.loc[first_valid:]
+        costs         = costs.loc[first_valid:]
+        weights       = weights.loc[first_valid:]
+        signal        = signal.loc[first_valid:]
 
         return BacktestResults(
             portfolio_returns=net_returns,

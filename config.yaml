@@ -4,6 +4,11 @@ strategy:
   rebalancing: monthly
   max_position_weight: 0.15
   vol_com_months: 3
+  # Daniel & Moskowitz (2016): Momentum Crashes — filtro de crash regime
+  use_crash_filter: true
+  # Moreira & Muir (2017): Volatility-Managed Portfolios — vol-scaling del portafolio
+  use_portfolio_vol_scaling: true
+  target_portfolio_vol: 0.07
 
 transaction_costs:
   bid_ask_spread: 0.001

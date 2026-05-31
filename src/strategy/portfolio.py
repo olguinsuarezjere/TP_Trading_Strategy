@@ -37,7 +37,7 @@ def build_portfolio(
     Returns (weights, signal) DataFrames aligned to returns index.
     """
     from .volatility import compute_ex_ante_vol
-    from .signals import compute_tsmom_signal, compute_signal_strength
+    from .signals import compute_tsmom_signal, compute_signal_strength, compute_crash_filter
 
     vol = compute_ex_ante_vol(returns, com_months=config["strategy"]["vol_com_months"])
 
@@ -45,6 +45,11 @@ def build_portfolio(
         signal = compute_signal_strength(returns, lookback=config["strategy"]["lookback_months"])
     else:
         signal = compute_tsmom_signal(returns, lookback=config["strategy"]["lookback_months"])
+
+    # Daniel & Moskowitz (2016): crash regime filter
+    if config["strategy"].get("use_crash_filter", False):
+        crash_multiplier = compute_crash_filter(returns)
+        signal = signal.mul(crash_multiplier, axis=0)
 
     weights = compute_vol_scaled_weights(signal, vol, target_vol=config["strategy"]["target_volatility"])
     weights = apply_position_constraints(weights, max_weight=config["strategy"]["max_position_weight"])
