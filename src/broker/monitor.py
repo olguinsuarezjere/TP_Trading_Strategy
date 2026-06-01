@@ -8,18 +8,18 @@ from .ibkr import IBKRConnection
 def get_live_portfolio(conn: IBKRConnection) -> pd.DataFrame:
     """
     Retorna el portafolio actual con posiciones, valores y P&L.
+
+    Usa la vía rápida (`get_portfolio_fast`, una sola llamada vía stream de cuenta)
+    en vez de pedir precio ticker por ticker — clave con muchas posiciones.
     """
-    positions_df = conn.get_positions()
+    positions_df = conn.get_portfolio_fast()
     if positions_df.empty:
         return positions_df
 
     summary = conn.get_account_summary()
-    net_liq = summary.get("NetLiquidation", 1.0)
+    net_liq = summary.get("NetLiquidation", 1.0) or 1.0
 
     positions_df["weight"] = positions_df["market_value"] / net_liq
-    positions_df["unrealized_pnl"] = (
-        (positions_df["market_price"] - positions_df["avg_cost"]) * positions_df["qty"]
-    )
     return positions_df
 
 

@@ -4,6 +4,15 @@ strategy:
   rebalancing: monthly
   max_position_weight: 0.15
   vol_com_months: 3
+  # --- Señal (mejora validada en el motor real con walk-forward) ---
+  # signal_mode: binary (Moskowitz 2012) | strength (Baz 2015) | multihorizon (AQR)
+  # 'strength' (señal continua normalizada por vol) sube el Sharpe 0.27 -> 0.47.
+  # multihorizon y class_balanced se probaron pero NO mejoran en este universo de ETFs
+  # (quedan disponibles como opción en el dashboard).
+  signal_mode: strength
+  lookbacks: [3, 6, 12]
+  # weighting: pooled (1/N global) | class_balanced (presupuesto igual por clase de activo)
+  weighting: pooled
   # Daniel & Moskowitz (2016): Momentum Crashes — filtro de crash regime
   use_crash_filter: true
   # Moreira & Muir (2017): Volatility-Managed Portfolios — vol-scaling del portafolio
@@ -15,13 +24,17 @@ transaction_costs:
   commission_pct: 0.0005
 
 backtest:
-  start_date: "2015-01-01"
-  end_date: "2024-12-31"
+  start_date: "2012-01-01"
+  end_date: "2026-05-31"
   initial_capital: 1_000_000
 
 data:
   path: "Data/etf_prices.parquet"
   yfinance_update: false
+  # Meses mínimos de historia para incluir un ETF en el backtest. Los ETFs que
+  # arrancaron después de 2012 se usan desde su inception; este piso evita meter
+  # ETFs tan nuevos que nunca llegan a formar una señal (~2x el lookback máximo).
+  min_history_months: 24
 
 broker:
   host: "127.0.0.1"

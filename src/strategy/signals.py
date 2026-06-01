@@ -58,3 +58,18 @@ def compute_signal_strength(returns: pd.DataFrame, lookback: int = 12) -> pd.Dat
     normalized = cumulative / rolling_std.replace(0, np.nan)
     # Clip extreme values to [-3, 3] to avoid outsized positions
     return normalized.clip(-3, 3)
+
+
+def compute_multihorizon_signal(
+    returns: pd.DataFrame,
+    lookbacks: tuple[int, ...] = (3, 6, 12),
+) -> pd.DataFrame:
+    """
+    Señal de momentum multi-horizonte (Moskowitz et al. 2012; práctica estándar AQR).
+
+    Promedia la señal continua normalizada por volatilidad (Baz et al. 2015) sobre
+    varios lookbacks. Captar tendencias de corto, medio y largo plazo a la vez reduce
+    el ruido de un único horizonte y suaviza el turnover, mejorando el Sharpe.
+    """
+    parts = [compute_signal_strength(returns, lookback=lb) for lb in lookbacks]
+    return sum(parts) / len(parts)

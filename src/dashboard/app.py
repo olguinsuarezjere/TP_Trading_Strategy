@@ -19,7 +19,9 @@ from src.backtest.metrics import (
     sharpe_ratio, sortino_ratio, annualized_return, annualized_volatility,
     max_drawdown, calmar_ratio, hit_rate, turnover,
 )
-from src.robustness.sensitivity import lookback_sensitivity, target_vol_sensitivity, cost_sensitivity
+from src.robustness.sensitivity import (
+    lookback_sensitivity, target_vol_sensitivity, cost_sensitivity, optimize_sharpe,
+)
 from src.robustness.stress_test import analyze_crisis_performance, CRISIS_PERIODS
 from src.robustness.out_of_sample import walk_forward, expanding_window
 from src.strategy.signals import compute_tsmom_signal, compute_signal_strength
@@ -49,6 +51,15 @@ def _run_backtest(config_str: str, signal_type: str):
     returns = load_returns(config)
     results = BacktestEngine(config).run(returns, use_signal_strength=(signal_type == "strength"))
     return results, returns
+
+
+@st.cache_data(show_spinner="Optimizando Sharpe (lookback × target vol)…")
+def _optimal_params(base_config_str: str):
+    """(lookback, target_vol) que maximizan el Sharpe para la señal/ponderación dadas."""
+    config = yaml.safe_load(base_config_str)
+    returns = load_returns(config)
+    best, _ = optimize_sharpe(returns, config)
+    return best
 
 
 # ============================================================ HELPERS
@@ -113,6 +124,23 @@ def topbar(asof, lookback, target_vol, signal_type, sharpe):
     </div>"""
 
 
+def calc_overlay(signal_type, weighting, window):
+    return f"""
+    <div class="calc-overlay">
+      <div class="calc-card">
+        <div class="calc-eyebrow">TSMOM · OPTIMIZACIÓN IN-SAMPLE</div>
+        <div class="calc-title">Calculando parámetros óptimos</div>
+        <div class="calc-sub">
+          Buscando el <b>lookback</b> y el <b>target vol</b> que maximizan el Sharpe<br>
+          sobre toda la historia de los ETFs <b>({window})</b><br>
+          para señal <b>{signal_type.upper()}</b> · ponderación <b>{weighting.upper()}</b>
+        </div>
+        <div class="calc-bar"></div>
+        <div class="calc-foot"><span class="dot"></span>barriendo grilla de parámetros…</div>
+      </div>
+    </div>"""
+
+
 def panel(title, body, sub="", right=""):
     sub_h = f'<span class="panel-sub">{sub}</span>' if sub else ""
     right_h = f'<div class="panel-sub">{right}</div>' if right else ""
@@ -127,9 +155,14 @@ st.set_page_config(page_title="TSMOM Terminal · F414 UdeSA", page_icon="📟",
                    layout="wide", initial_sidebar_state="expanded")
 
 if "theme" not in st.session_state:
-    st.session_state.theme = "phosphor"
+    st.session_state.theme = "graphite"
 st.markdown(T.inject(st.session_state.theme), unsafe_allow_html=True)
 PAL = T.PALETTES[st.session_state.theme]
+
+# Placeholder en el área principal para el overlay de cálculo del óptimo.
+# Se crea antes del sidebar para que renderice sobre toda la pantalla; se llena
+# justo antes de optimizar y se vacía al terminar (sólo se ve cuando el cálculo tarda).
+opt_overlay = st.empty()
 
 with st.sidebar:
     st.markdown(
@@ -139,25 +172,58 @@ with st.sidebar:
 
     page = st.radio("Navegación",
                     ["01 · Overview", "02 · Backtest", "03 · Robustness",
-                     "04 · Live Portfolio", "05 · Trade Log"],
+                     "04 · Live Portfolio", "05 · Trade Log", "06 · Rebalances"],
                     label_visibility="collapsed")
 
     st.markdown('<div class="side-label">Parámetros</div>', unsafe_allow_html=True)
-    lookback = st.slider("Lookback (meses)", 3, 24, 12, step=1)
-    target_vol = st.slider("Target Vol (anual)", 0.05, 0.40, 0.10, step=0.01)
-    signal_type = st.radio("Señal", ["binary", "strength"], horizontal=True)
-
-    st.markdown('<div class="side-label">Estilo</div>', unsafe_allow_html=True)
-    theme_choice = st.radio("Tema", ["phosphor", "amber", "ice"], horizontal=True,
-                            index=["phosphor", "amber", "ice"].index(st.session_state.theme),
-                            label_visibility="collapsed")
-    if theme_choice != st.session_state.theme:
-        st.session_state.theme = theme_choice
-        st.rerun()
 
     config = _load_config()
+
+    # Señal y ponderación van primero: el óptimo de (lookback, target vol) depende de ellas.
+    signal_type = st.radio("Señal", ["strength", "binary", "multihorizon"], horizontal=True)
+    weighting = st.radio("Ponderación", ["pooled", "class_balanced"], horizontal=True)
+
+    # Óptimo in-sample (maximiza Sharpe) para la señal/ponderación elegidas.
+    base_cfg = yaml.safe_load(yaml.dump(config))
+    base_cfg["strategy"]["signal_mode"] = signal_type
+    base_cfg["strategy"]["weighting"] = weighting
+    # El overlay se pinta antes de optimizar; Streamlit sólo lo muestra mientras el
+    # cálculo bloquea (cache frío / reinicio) y lo limpia apenas termina.
+    opt_window = f'{config["backtest"]["start_date"][:4]}–{config["backtest"]["end_date"][:4]}'
+    opt_overlay.markdown(calc_overlay(signal_type, weighting, opt_window), unsafe_allow_html=True)
+    opt = _optimal_params(yaml.dump(base_cfg))
+    opt_overlay.empty()
+
+    # Default = óptimo. Se fija al óptimo al abrir el dashboard y cada vez que cambia
+    # señal/ponderación; entre medio el usuario puede mover los sliders libremente.
+    combo = f"{signal_type}|{weighting}"
+    if st.session_state.get("_opt_combo") != combo:
+        st.session_state["_opt_combo"] = combo
+        st.session_state["lookback"] = opt["lookback"]
+        st.session_state["target_vol"] = opt["target_vol"]
+
+    lookback = st.slider("Lookback (meses)", 3, 24, step=1, key="lookback")
+    target_vol = st.slider("Target Vol (anual)", 0.05, 0.40, step=0.01, key="target_vol")
+
+    at_opt = (lookback == opt["lookback"] and abs(target_vol - opt["target_vol"]) < 0.005)
+    st.caption(
+        f"{'★ ' if at_opt else ''}Óptimo Sharpe **{opt['sharpe']:.2f}** · "
+        f"LB {opt['lookback']}m · TV {opt['target_vol']*100:.0f}%"
+        + ("" if at_opt else " · _moviste los parámetros fuera del óptimo_")
+    )
+    def _reset_to_opt(lb=opt["lookback"], tv=opt["target_vol"]):
+        # Callback: corre antes del rerun, por eso sí puede modificar el estado
+        # de widgets ya instanciados (lookback / target_vol).
+        st.session_state["lookback"] = lb
+        st.session_state["target_vol"] = tv
+
+    if not at_opt:
+        st.button("↺ Volver al óptimo", use_container_width=True, on_click=_reset_to_opt)
+
     config["strategy"]["lookback_months"] = lookback
     config["strategy"]["target_volatility"] = target_vol
+    config["strategy"]["signal_mode"] = signal_type
+    config["strategy"]["weighting"] = weighting
     config_str = yaml.dump(config)
 
     win = f'{config["backtest"]["start_date"][:7]} → {config["backtest"]["end_date"][:7]}'
@@ -175,6 +241,7 @@ r = results.portfolio_returns
 equity = (1 + r).cumprod()
 sharpe = sharpe_ratio(r)
 asof = returns.index[-1].strftime("%Y-%m")
+period_label = f"{returns.index[0].year}–{returns.index[-1].year}"
 
 st.markdown(topbar(asof, lookback, target_vol, signal_type, sharpe), unsafe_allow_html=True)
 
@@ -198,7 +265,7 @@ if page.startswith("01"):
 
     strip = "".join([
         kpi("Universo", f"{len(ETF_UNIVERSE)}", "ETFs · 4 clases"),
-        kpi("Sharpe (IS)", f"{sharpe:.2f}", "2015–2024", "accent", "tone-accent"),
+        kpi("Sharpe (IS)", f"{sharpe:.2f}", period_label, "accent", "tone-accent"),
         kpi("Ret. desde inicio", pct(since, 1, True), "neto de costos", "", f"tone-{tone(since)}"),
         kpi("Net exposure", pct(net_exp, 0, True), f"{n_long}L · {n_short}S", "", f"tone-{tone(net_exp)}"),
         kpi("Posiciones", f"{n_long + n_short}", "todas activas"),
@@ -423,97 +490,356 @@ elif page.startswith("03"):
 
 elif page.startswith("04"):
     import time as _time
+    from datetime import datetime as _dt
+    from src.broker import state as _state
+    from src.broker.session import ibkr_session
+    from src.broker.runner import check_rebalance, compute_target_weights
 
     st.markdown('<div class="page-h1">Live Portfolio <span class="dim">— IBKR Paper Trading</span></div>'
-                '<div class="page-sub">requiere TWS corriendo con API activada (puerto 7497)</div>',
+                '<div class="page-sub">conectá tu cuenta · poné la estrategia a correr · '
+                'cerrá y reconectá cuando quieras — IBKR mantiene tus posiciones</div>',
                 unsafe_allow_html=True)
 
-    cb, ca, ci = st.columns([1, 1, 1])
-    refresh_now = cb.button("🔄 Conectar y actualizar")
-    auto_refresh = ca.toggle("Auto-refresh", value=False)
-    interval_secs = ci.number_input("Intervalo (seg)", 10, 300, 30, 10, disabled=not auto_refresh)
+    # ====================================================== HORARIO DE MERCADO (US)
+    from src.broker.market_hours import us_market_status
+    mk = us_market_status()
+    trade_note = ("market orders confiables" if mk["can_trade"]
+                  else "market orders POCO confiables — esperá la sesión regular")
+    mk_body = (
+        f'<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'
+        f'<span style="font-size:1.15rem;font-weight:700;color:{mk["color"]}">{mk["label"]}</span>'
+        f'<span class="panel-sub">{mk["detail"]}</span></div>'
+        f'<div class="mtable" style="margin-top:8px">'
+        f'<div class="mrow"><span class="mrow-k">Ahora</span>'
+        f'<span class="mrow-v">{mk["now_et"]}  ·  {mk["now_local"]} (tu hora)</span></div>'
+        f'<div class="mrow"><span class="mrow-k">Sesión regular</span>'
+        f'<span class="mrow-v">{mk["regular_et"]}  ·  {mk["regular_local"]}</span></div>'
+        f'<div class="mrow"><span class="mrow-k">Horario extendido</span>'
+        f'<span class="mrow-v">{mk["extended_et"]}  ·  {mk["extended_local"]}</span></div>'
+        f'<div class="mrow"><span class="mrow-k">Operatoria ahora</span>'
+        f'<span class="mrow-v" style="color:{mk["color"]}">{trade_note}</span></div>'
+        + ('' if mk["can_trade"] else
+           f'<div class="mrow"><span class="mrow-k">Próxima sesión regular</span>'
+           f'<span class="mrow-v">{mk["next_open_local"]} (tu hora)</span></div>')
+        + '</div>')
+    st.markdown(panel("HORARIO DE MERCADO — ETFs US", mk_body,
+                      sub="NYSE/NASDAQ · no contempla feriados"), unsafe_allow_html=True)
+    if not mk["can_trade"]:
+        st.caption("⚠️ Fuera de la sesión regular las órdenes a mercado pueden no ejecutarse "
+                   "(sin liquidez / preset TIF). Para operar en firme, hacelo en sesión regular.")
 
-    def _show_portfolio():
-        from src.broker.ibkr import IBKRConnection
+    STATUS_UI = {
+        "running": ("● ACTIVA", "var(--accent)"),
+        "paused":  ("⏸ PAUSADA", "#e0a23b"),
+        "stopped": ("○ DETENIDA", "var(--text-dim)"),
+    }
+
+    # Target weights del próximo rebalanceo (no requiere IBKR).
+    target_weights = compute_target_weights(returns, config)
+    reb_params = {"signal_mode": signal_type, "lookback": lookback, "target_vol": target_vol}
+
+    def _deploy_capital(net_liq: float) -> float:
+        """Capital que el usuario decidió destinar, acotado al NetLiquidation real.
+
+        Precaución: la estrategia NUNCA despliega más que lo que el usuario eligió
+        en «Capital a destinar», y nunca más que el NetLiquidation de la cuenta."""
+        chosen = st.session_state.get("capital_deploy")
+        if not chosen or chosen <= 0:
+            chosen = net_liq
+        return float(min(chosen, net_liq))
+
+    def _fetch_live(execute_due=False):
+        """Conecta, trae portafolio/cuenta/PnL e info de conexión. Si execute_due y
+        la estrategia está ACTIVA con un rebalanceo pendiente, lo ejecuta (auto-trade)."""
         from src.broker.monitor import get_live_portfolio, compute_live_pnl
-        broker = config["broker"]
-        conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
-        conn.connect()
-        portfolio_df = get_live_portfolio(conn)
-        account = conn.get_account_summary()
-        pnl = compute_live_pnl(portfolio_df)
-        conn.disconnect()
+        from src.broker.orders import execute_rebalance
+        auto_msg = None
+        with ibkr_session(config, "monitor") as conn:
+            info = conn.get_connection_info()
+            if execute_due and _state.is_running() and _state.rebalance_due():
+                capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
+                orders = execute_rebalance(conn, target_weights, capital=capital,
+                                           dry_run=False, trigger="auto", params=reb_params)
+                auto_msg = f"Auto-trade ejecutó {len(orders)} órdenes con capital {usd(capital)}."
+            portfolio_df = get_live_portfolio(conn)
+            account = conn.get_account_summary()
+            pnl = compute_live_pnl(portfolio_df)
+        st.session_state["live"] = {"account": account, "portfolio": portfolio_df,
+                                    "pnl": pnl, "info": info, "ts": _time.strftime("%H:%M:%S")}
+        if auto_msg:
+            st.session_state["auto_msg"] = auto_msg
+
+    def _test_connection():
+        with ibkr_session(config, "status") as conn:
+            st.session_state["conn_info"] = {**conn.get_connection_info(),
+                                             "ts": _time.strftime("%H:%M:%S")}
+
+    # ====================================================== PANEL DE CONEXIÓN
+    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+    test_now = cc1.button("🔌 Test conexión")
+    refresh_now = cc2.button("🔄 Actualizar portafolio")
+    auto_refresh = cc3.toggle("Auto-refresh", value=False)
+    interval_secs = cc4.number_input("Intervalo (seg)", 10, 300, 30, 10, disabled=not auto_refresh)
+
+    if test_now:
+        try:
+            _test_connection()
+        except Exception as e:
+            st.session_state["conn_info"] = None
+            st.error(f"No se pudo conectar a IBKR TWS: {e}")
+            st.info("Verificá que TWS esté abierto y la API habilitada en puerto 7497.")
+
+    info = st.session_state.get("conn_info") or (st.session_state.get("live") or {}).get("info")
+    broker = config["broker"]
+    if info and info.get("connected"):
+        # Resumen de validación de operabilidad (de logs/ibkr_validation.csv si existe).
+        val_path = os.path.join(ROOT, "logs", "ibkr_validation.csv")
+        val_txt = ""
+        if os.path.exists(val_path) and os.path.getsize(val_path) > 1:
+            vdf = pd.read_csv(val_path)
+            val_txt = f" · {int(vdf['tradeable'].sum())}/{len(vdf)} ETFs operables"
+        conn_body = (
+            f'<div class="mtable">'
+            f'<div class="mrow"><span class="mrow-k">Estado</span>'
+            f'<span class="mrow-v tone-accent">● CONECTADO</span></div>'
+            f'<div class="mrow"><span class="mrow-k">Endpoint</span>'
+            f'<span class="mrow-v">{info["host"]}:{info["port"]}</span></div>'
+            f'<div class="mrow"><span class="mrow-k">Cuenta</span>'
+            f'<span class="mrow-v">{info["account"]}</span></div>'
+            f'<div class="mrow"><span class="mrow-k">Servidor IBKR</span>'
+            f'<span class="mrow-v">v{info.get("server_version","?")}{val_txt}</span></div>'
+            f'</div>')
+        st.markdown(panel("CONEXIÓN BROKER — IBKR", conn_body,
+                          sub=f"último check {info.get('ts','—')}"), unsafe_allow_html=True)
+    else:
+        st.markdown(panel("CONEXIÓN BROKER — IBKR",
+                          '<div class="mtable">'
+                          '<div class="mrow"><span class="mrow-k">Estado</span><span class="mrow-v tone-neg">○ DESCONECTADO</span></div>'
+                          '<div class="mrow"><span class="mrow-k">1 · TWS → Edit → Global Configuration → API → Settings</span><span></span></div>'
+                          '<div class="mrow"><span class="mrow-k">2 · ✅ Enable ActiveX and Socket Clients</span><span></span></div>'
+                          f'<div class="mrow"><span class="mrow-k">3 · Puerto</span><span class="mrow-v">{broker["port"]} (7497 paper · 7496 real)</span></div>'
+                          '<div class="mrow"><span class="mrow-k">4 · Agregar 127.0.0.1 en Trusted IPs</span><span></span></div>'
+                          '<div class="mrow"><span class="mrow-k">5 · Clic en «Test conexión» arriba</span><span></span></div>'
+                          '</div>', sub=f"{broker['host']}:{broker['port']}"), unsafe_allow_html=True)
+
+    # ====================================================== CAPITAL A DESTINAR
+    _net_liq = (st.session_state.get("live") or {}).get("account", {}).get("NetLiquidation")
+    cap_c1, cap_c2 = st.columns([1, 1.4])
+    _cap_default = float(st.session_state.get("capital_deploy")
+                         or (_net_liq if _net_liq else config["backtest"]["initial_capital"]))
+    capital_deploy = cap_c1.number_input(
+        "💰 Capital a destinar (USD)", min_value=1_000.0,
+        max_value=float(_net_liq) if _net_liq else 100_000_000.0,
+        value=min(_cap_default, float(_net_liq)) if _net_liq else _cap_default,
+        step=1_000.0, key="capital_deploy",
+        help="Cuánta plata querés que la estrategia despliegue. Nunca opera por encima "
+             "de este monto ni del NetLiquidation real de la cuenta.")
+    if _net_liq:
+        _pctnl = capital_deploy / _net_liq * 100
+        cap_c2.caption(f"De **{usd(_net_liq)}** disponibles en la cuenta → desplegás "
+                       f"**{usd(capital_deploy)}** (**{_pctnl:.0f}%**). El resto queda en cash.")
+    else:
+        cap_c2.caption("Conectá / actualizá el portafolio para acotar este monto al "
+                       "NetLiquidation real de tu cuenta.")
+
+    # ====================================================== ESTRATEGIA (estado)
+    auto_trade = st.toggle("⚡ Auto-trade — ejecutar el rebalanceo mensual solo (respeta pausa/kill)",
+                           value=False,
+                           help="Si está activo y la estrategia está ACTIVA, cuando empieza un mes "
+                                "nuevo el dashboard ejecuta el rebalanceo automáticamente al actualizar. "
+                                "Si está apagado, te avisa y vos confirmás.")
+
+    # Actualizar portafolio. Auto-trade solo ejecuta órdenes en un refresh real
+    # (manual o auto-refresh); el "Test conexión" nunca opera, solo monitorea.
+    try:
+        if refresh_now or auto_refresh:
+            _fetch_live(execute_due=auto_trade)
+        elif test_now and info:
+            _fetch_live(execute_due=False)
+    except Exception as e:
+        st.error(f"Error al traer el portafolio de IBKR: {e}")
+
+    _am = st.session_state.pop("auto_msg", None)
+    if _am:
+        st.success("⚡ " + _am)
+
+    strat = _state.get_state()
+    chk = check_rebalance()
+    label, color = STATUS_UI.get(strat["status"], STATUS_UI["stopped"])
+
+    if strat["status"] == "stopped":
+        st.markdown(
+            f'<div class="panel"><div class="panel-body">'
+            f'<b style="color:{color}">{label}</b> — la estrategia no está enrolada. '
+            f'Iniciála para empezar a gestionar el portafolio con TSMOM.</div></div>',
+            unsafe_allow_html=True)
+        if st.button("▶ Iniciar estrategia", type="primary"):
+            _state.start_strategy(reb_params)
+            st.rerun()
+    else:
+        enrolled = strat.get("enrolled_at", "—")
+        p = strat.get("params", {})
+        pstr = (f'{str(p.get("signal_mode","?")).upper()} · LB{p.get("lookback","?")} · '
+                f'TV{int(float(p.get("target_vol",0))*100)}%' if p else "—")
+        last_rb = strat.get("last_rebalance_at") or "nunca"
+        banner = (
+            f'<div class="panel" style="border-color:{color}"><div class="panel-body">'
+            f'<b style="color:{color}">{label}</b> desde <b>{enrolled}</b> · {pstr}<br>'
+            f'<span class="mrow-k">Último rebalanceo:</span> {last_rb} · '
+            f'<span class="mrow-k">Próximo:</span> {chk.next_rebalance_date}</div></div>')
+        st.markdown(banner, unsafe_allow_html=True)
+
+        sc1, sc2 = st.columns(2)
+        if strat["status"] == "running" and sc1.button("⏸ Pausar estrategia"):
+            _state.pause("pausa manual (dashboard)")
+            st.rerun()
+        if strat["status"] == "paused" and sc1.button("▶ Reanudar estrategia", type="primary"):
+            _state.resume()
+            st.rerun()
+
+        # ----- Catch-up: rebalanceo pendiente (mes nuevo / primer rebalanceo) -----
+        if chk.due:
+            st.markdown(
+                f'<div class="panel" style="border-color:#e0a23b"><div class="panel-body" '
+                f'style="color:#e0a23b">⚠️ <b>REBALANCEO PENDIENTE</b> — {chk.reason} '
+                f'Revisalo y ejecutalo cuando quieras.</div></div>', unsafe_allow_html=True)
+            uc1, uc2 = st.columns(2)
+            if uc1.button("🔍 Ver órdenes del pendiente"):
+                from src.broker.orders import execute_rebalance
+                cap = _deploy_capital((st.session_state.get("live") or {}).get("account", {}).get("NetLiquidation", 1_000_000))
+                st.session_state["dry_run_orders"] = execute_rebalance(
+                    None, target_weights, capital=cap, dry_run=True)
+            if not _state.is_paused() and uc2.button("✅ Ejecutar rebalanceo pendiente", type="primary"):
+                from src.broker.orders import execute_rebalance
+                try:
+                    with ibkr_session(config, "rebalance") as conn:
+                        capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
+                        execute_rebalance(conn, target_weights, capital=capital,
+                                          dry_run=False, trigger="catchup", params=reb_params)
+                    st.session_state.pop("dry_run_orders", None)
+                    st.success(f"Rebalanceo pendiente ejecutado. Capital: {usd(capital)}")
+                    _fetch_live()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al ejecutar el pendiente: {e}")
+        elif strat["status"] == "running":
+            st.caption(f"✓ {chk.reason}")
+
+    live = st.session_state.get("live")
+
+    # ====================================================== PORTAFOLIO EN VIVO
+    if live:
+        account = live["account"]
+        portfolio_df = live["portfolio"]
+        pnl = live["pnl"]
+        st.caption(f"Portafolio actualizado: {live['ts']} · cuenta paper IBKR")
 
         strip = "".join([
             kpi("Net Liquidation", usd(account.get("NetLiquidation", 0))),
             kpi("Cash", usd(account.get("TotalCashValue", 0))),
             kpi("Unrealized P&L", usd(pnl.get("total_unrealized_pnl", 0)), "",
                 "", f"tone-{tone(pnl.get('total_unrealized_pnl', 0))}"),
-            kpi("Posiciones", f"{pnl.get('n_positions', 0)}"),
+            kpi("Posiciones", f"{pnl.get('n_positions', 0)}", f"{pnl.get('n_long',0)}L · {pnl.get('n_short',0)}S"),
             kpi("Buying Power", usd(account.get("NetLiquidation", 0) * 2)),
         ])
         st.markdown(f'<div class="kpi-strip">{strip}</div>', unsafe_allow_html=True)
 
+        # ----- Posiciones abiertas -----
         if not portfolio_df.empty:
-            portfolio_df["asset_class"] = portfolio_df["ticker"].map(ETF_UNIVERSE)
+            pdf = portfolio_df.copy()
+            pdf["asset_class"] = pdf["ticker"].map(ETF_UNIVERSE)
             st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                        'POSICIONES ABIERTAS</div></div>', unsafe_allow_html=True)
+                        'POSICIONES ABIERTAS <span class="panel-sub">tiempo real</span></div></div>',
+                        unsafe_allow_html=True)
             st.dataframe(
-                portfolio_df[["ticker", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
+                pdf[["ticker", "asset_class", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
                 .sort_values("market_value", ascending=False),
                 use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
         else:
-            st.warning("Sin posiciones abiertas en la cuenta paper.")
-        return account
+            st.info("Sin posiciones abiertas en la cuenta paper.")
 
-    if refresh_now or auto_refresh:
-        try:
-            _show_portfolio()
-            st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                        'EJECUTAR REBALANCEO TSMOM</div></div>', unsafe_allow_html=True)
-            from src.strategy.portfolio import build_portfolio
-            weights_df, _ = build_portfolio(returns, config)
-            target_weights = weights_df.iloc[-1].dropna()
-            target_weights = target_weights[target_weights != 0]
-            cd, ce = st.columns(2)
-            if cd.button("🔍 Dry Run — Ver órdenes"):
-                from src.broker.orders import execute_rebalance
-                st.session_state["dry_run_orders"] = execute_rebalance(
-                    None, target_weights, capital=1_000_000, dry_run=True)
-            if st.session_state.get("dry_run_orders"):
-                st.dataframe(pd.DataFrame(st.session_state["dry_run_orders"]),
-                             use_container_width=True, hide_index=True)
-            st.warning("⚠️ El botón de abajo ejecuta órdenes REALES en tu cuenta paper.")
+        # ----- Drift: target TSMOM vs actual -----
+        cur_w = (portfolio_df.set_index("ticker")["weight"] if not portfolio_df.empty
+                 else pd.Series(dtype=float))
+        drift_rows = []
+        for tk in target_weights.index.union(cur_w.index):
+            tw = float(target_weights.get(tk, 0.0))
+            cw = float(cur_w.get(tk, 0.0))
+            drift_rows.append({"ticker": tk, "asset_class": ETF_UNIVERSE.get(tk, "—"),
+                               "target_w": round(tw, 4), "current_w": round(cw, 4),
+                               "drift": round(tw - cw, 4)})
+        drift_df = pd.DataFrame(drift_rows)
+        drift_df["abs"] = drift_df["drift"].abs()
+        drift_df = drift_df.sort_values("abs", ascending=False).drop(columns="abs")
+        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                    'DRIFT — TARGET TSMOM vs ACTUAL <span class="panel-sub">'
+                    'qué hace falta operar para alcanzar el target</span></div></div>',
+                    unsafe_allow_html=True)
+        st.dataframe(drift_df.head(25), use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ----- Rebalanceo manual (override — funciona aunque no estés enrolado) -----
+        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                    'REBALANCEO MANUAL <span class="panel-sub">'
+                    f'override · {len(target_weights)} posiciones objetivo</span></div></div>',
+                    unsafe_allow_html=True)
+        cd, ce = st.columns(2)
+        if cd.button("🔍 Dry Run — Ver órdenes"):
+            from src.broker.orders import execute_rebalance
+            cap = _deploy_capital(account.get("NetLiquidation", 1_000_000))
+            st.session_state["dry_run_orders"] = execute_rebalance(
+                None, target_weights, capital=cap, dry_run=True)
+        if st.session_state.get("dry_run_orders"):
+            st.dataframe(pd.DataFrame(st.session_state["dry_run_orders"]),
+                         use_container_width=True, hide_index=True)
+
+        if _state.is_paused():
+            st.warning("⏸ Estrategia pausada: reanudala (arriba) para poder ejecutar.")
+        else:
+            st.warning("⚠️ El botón de abajo ejecuta órdenes REALES en tu cuenta paper "
+                       "y registra el rebalanceo.")
             if ce.button("🚀 Ejecutar en IBKR", type="primary"):
-                from src.broker.ibkr import IBKRConnection
                 from src.broker.orders import execute_rebalance
-                broker = config["broker"]
-                conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
                 try:
-                    conn.connect()
-                    capital = conn.get_account_summary().get("NetLiquidation", 1_000_000)
-                    execute_rebalance(conn, target_weights, capital=capital, dry_run=False)
-                    st.success(f"Rebalanceo ejecutado. Capital: {usd(capital)}")
+                    with ibkr_session(config, "rebalance") as conn:
+                        capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
+                        execute_rebalance(conn, target_weights, capital=capital,
+                                          dry_run=False, trigger="dashboard", params=reb_params)
+                    st.success(f"Rebalanceo ejecutado y registrado. Capital: {usd(capital)}")
                     st.session_state.pop("dry_run_orders", None)
-                finally:
-                    conn.disconnect()
-            st.markdown('</div>', unsafe_allow_html=True)
-        except Exception as e:
-            st.error(f"Error al conectar con IBKR TWS: {e}")
-            st.info("Verificá que TWS esté abierto y la API habilitada en puerto 7497.")
+                    _fetch_live()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al ejecutar: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ----- KILL SWITCH -----
+        st.markdown('<div class="panel" style="border-color:var(--neg)">'
+                    '<div class="panel-head"><div class="panel-title" style="color:var(--neg)">'
+                    '⛔ DETENER Y CERRAR TODO <span class="panel-sub">'
+                    'cierra TODAS las posiciones a mercado y detiene la estrategia</span>'
+                    '</div></div>', unsafe_allow_html=True)
+        ck1, ck2 = st.columns([1.3, 1])
+        confirm_kill = ck1.checkbox("Confirmo: cerrar todo y detener la estrategia")
+        if ck2.button("🔪 EJECUTAR CORTE", type="primary", disabled=not confirm_kill):
+            from src.broker.orders import close_all_positions
+            try:
+                with ibkr_session(config, "kill") as conn:
+                    closed = close_all_positions(conn, dry_run=False,
+                                                 reason="kill switch (dashboard)")
+                _state.stop("kill switch (dashboard)")
+                st.session_state.pop("dry_run_orders", None)
+                st.error(f"⛔ Estrategia DETENIDA. Se enviaron {len(closed)} órdenes de cierre.")
+                _fetch_live()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al cortar: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
         if auto_refresh:
             _time.sleep(interval_secs)
             st.rerun()
-    else:
-        st.markdown(panel("CÓMO ACTIVAR LA API EN TWS",
-                          '<div class="mtable">'
-                          '<div class="mrow"><span class="mrow-k">1 · TWS → Edit → Global Configuration → API → Settings</span><span></span></div>'
-                          '<div class="mrow"><span class="mrow-k">2 · ✅ Enable ActiveX and Socket Clients</span><span></span></div>'
-                          '<div class="mrow"><span class="mrow-k">3 · Puerto</span><span class="mrow-v">7497 paper · 7496 real</span></div>'
-                          '<div class="mrow"><span class="mrow-k">4 · Agregar 127.0.0.1 en Trusted IPs</span><span></span></div>'
-                          '<div class="mrow"><span class="mrow-k">5 · Clic en «Conectar y actualizar» arriba</span><span></span></div>'
-                          '</div>'), unsafe_allow_html=True)
 
 
 # ============================================================ PÁGINA 5 · TRADE LOG
@@ -558,5 +884,53 @@ elif page.startswith("05"):
     else:
         st.markdown(panel("SIN REGISTROS",
                           '<div class="mrow"><span class="mrow-k">No hay trades todavía. '
-                          'Ejecutá <b>python main.py execute</b> para registrar operaciones.</span></div>'),
+                          'Ejecutá un rebalanceo desde <b>Live Portfolio</b> para registrar operaciones.</span></div>'),
+                    unsafe_allow_html=True)
+
+
+# ============================================================ PÁGINA 6 · REBALANCES
+
+elif page.startswith("06"):
+    st.markdown('<div class="page-h1">Rebalances <span class="dim">— historial</span></div>'
+                '<div class="page-sub">cada evento de rebalanceo y de corte ejecutado en IBKR</div>',
+                unsafe_allow_html=True)
+
+    reb_path = os.path.join(ROOT, "logs", "rebalances.csv")
+    if os.path.exists(reb_path) and os.path.getsize(reb_path) > 1:
+        reb_df = pd.read_csv(reb_path)
+        reb_df["timestamp"] = pd.to_datetime(reb_df["timestamp"])
+        n_reb = int((reb_df["trigger"] != "KILL").sum())
+        n_kill = int((reb_df["trigger"] == "KILL").sum())
+        last = reb_df.sort_values("timestamp").iloc[-1]
+        strip = "".join([
+            kpi("Eventos totales", str(len(reb_df))),
+            kpi("Rebalanceos", str(n_reb), "", "", "tone-accent"),
+            kpi("Cortes (kill)", str(n_kill), "", "", "tone-neg"),
+            kpi("Último", last["timestamp"].strftime("%Y-%m-%d %H:%M"), str(last["trigger"])),
+        ])
+        st.markdown(f'<div class="kpi-strip" style="grid-template-columns:repeat(4,1fr)">{strip}</div>',
+                    unsafe_allow_html=True)
+
+        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                    'HISTORIAL DE REBALANCEOS</div></div>', unsafe_allow_html=True)
+        st.dataframe(reb_df.sort_values("timestamp", ascending=False),
+                     use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Órdenes de un rebalanceo puntual (trae trades.csv y filtra por rebalance_id)
+        trades_path = os.path.join(ROOT, "logs", "trades.csv")
+        if os.path.exists(trades_path) and os.path.getsize(trades_path) > 1:
+            tdf = pd.read_csv(trades_path)
+            if "rebalance_id" in tdf.columns:
+                rid = st.selectbox("Ver órdenes del rebalanceo",
+                                   reb_df.sort_values("timestamp", ascending=False)["rebalance_id"])
+                sub = tdf[tdf["rebalance_id"] == rid]
+                st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                            f'ÓRDENES · {rid}</div></div>', unsafe_allow_html=True)
+                st.dataframe(sub, use_container_width=True, hide_index=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(panel("SIN REBALANCEOS",
+                          '<div class="mrow"><span class="mrow-k">Todavía no se ejecutó ningún '
+                          'rebalanceo. Ejecutá uno desde <b>Live Portfolio</b>.</span></div>'),
                     unsafe_allow_html=True)

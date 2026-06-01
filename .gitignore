@@ -22,3 +22,7 @@ env/
 # Datos sensibles / config local
 .env
 *.local
+
+# Artefactos de runtime / backups (no versionar)
+logs/
+*.bak

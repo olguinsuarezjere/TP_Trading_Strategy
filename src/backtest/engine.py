@@ -26,6 +26,29 @@ def apply_portfolio_vol_scaling(
     return weights.mul(scaling, axis=0)
 
 
+def build_scaled_weights(
+    returns: pd.DataFrame,
+    config: dict,
+    use_signal_strength: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pesos FINALES de la estrategia: build_portfolio + (opcional) portfolio vol
+    scaling de Moreira-Muir + re-clip de posiciones.
+
+    Es la ÚNICA fuente de verdad de los pesos: la usan tanto el backtest como la
+    ejecución en vivo, para que en IBKR se operen exactamente los pesos validados.
+    """
+    weights, signal = build_portfolio(returns, config, use_signal_strength)
+    if config["strategy"].get("use_portfolio_vol_scaling", False):
+        weights = apply_portfolio_vol_scaling(
+            weights, returns,
+            target_portfolio_vol=config["strategy"].get("target_portfolio_vol", 0.07),
+            com_months=config["strategy"]["vol_com_months"],
+        )
+        from ..strategy.portfolio import apply_position_constraints
+        weights = apply_position_constraints(weights, config["strategy"]["max_position_weight"])
+    return weights, signal
+
+
 @dataclass
 class BacktestResults:
     portfolio_returns: pd.Series
@@ -48,18 +71,8 @@ class BacktestEngine:
         self.config = config
 
     def run(self, returns: pd.DataFrame, use_signal_strength: bool = False) -> BacktestResults:
-        weights, signal = build_portfolio(returns, self.config, use_signal_strength)
-
-        # Moreira & Muir (2017): portfolio-level vol scaling
-        if self.config["strategy"].get("use_portfolio_vol_scaling", False):
-            weights = apply_portfolio_vol_scaling(
-                weights,
-                returns,
-                target_portfolio_vol=self.config["strategy"].get("target_portfolio_vol", 0.07),
-                com_months=self.config["strategy"]["vol_com_months"],
-            )
-            from ..strategy.portfolio import apply_position_constraints
-            weights = apply_position_constraints(weights, self.config["strategy"]["max_position_weight"])
+        # Pesos finales (incluye portfolio vol scaling) — misma fuente que la ejecución en vivo.
+        weights, signal = build_scaled_weights(returns, self.config, use_signal_strength)
 
         # Gross portfolio return: sum of (weight_{t-1} * return_t)
         gross_returns = (weights * returns).sum(axis=1)

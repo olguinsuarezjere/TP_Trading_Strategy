@@ -13,12 +13,12 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 import yaml
 import click
 
-from src.broker.ibkr import IBKRConnection
-from src.broker.orders import execute_rebalance
-from src.broker.monitor import stream_portfolio_updates
+# NOTA: los imports del broker (ib_insync) son lazy — se cargan dentro de los
+# comandos que conectan a IBKR (test-connection / monitor / execute). Así
+# `dashboard` y `backtest` funcionan aunque ib_insync no esté instalado.
 from src.strategy.portfolio import build_portfolio
-from src.data.loader import load_returns, update_prices
-from src.data.universe import ETF_UNIVERSE
+from src.data.loader import load_returns, update_prices, data_status
+from src.data.universe import ETF_UNIVERSE, ASSET_CLASSES
 from src.backtest.engine import BacktestEngine
 from src.backtest.metrics import print_report
 from src.robustness.sensitivity import lookback_sensitivity, target_vol_sensitivity, cost_sensitivity
@@ -67,6 +67,62 @@ def update_data(ctx):
     click.echo(f"Actualizando {len(tickers)} ETFs en {path} ...")
     update_prices(path, tickers)
     click.secho("Datos actualizados.", fg="green")
+
+
+# ---------------------------------------------
+# data-status
+# ---------------------------------------------
+@cli.command("data-status")
+@click.pass_context
+def data_status_cmd(ctx):
+    """Muestra la consistencia entre universe.py y el parquet (y la cobertura)."""
+    config = _load_config(ctx.obj["config_path"])
+    st = data_status(config)
+
+    click.secho("== Consistencia universo <-> parquet ==", bold=True)
+    click.echo(f"  Universo (universe.py): {st['n_universe']} ETFs")
+    click.echo(f"  Columnas en parquet:    {st['n_parquet']}")
+    if st["window"]:
+        click.echo(f"  Ventana backtest:       {st['window'][0]:%Y-%m} a {st['window'][1]:%Y-%m}")
+
+    if st["missing"]:
+        click.secho(f"\n  [!] En universo SIN datos ({len(st['missing'])}): "
+                    f"{st['missing']}", fg="red")
+        click.echo("      -> correr: python scripts/fetch_missing_etfs.py")
+    else:
+        click.secho("\n  [OK] Todos los ETFs del universo tienen datos.", fg="green")
+
+    if st["orphans"]:
+        click.secho(f"\n  [!] En parquet pero NO en universo ({len(st['orphans'])}): "
+                    f"{st['orphans']}", fg="yellow")
+        click.echo("      (datos huérfanos: descargados pero ignorados por el backtest)")
+    else:
+        click.secho("  [OK] No hay columnas huérfanas en el parquet.", fg="green")
+
+    if st.get("redundant_present"):
+        click.secho(f"\n  [i] Redundantes por curación de liquidez (corr>=0.95), "
+                    f"datos en parquet pero fuera del universo activo "
+                    f"({len(st['redundant_present'])}): {st['redundant_present']}", fg="cyan")
+        click.echo("      (ver REDUNDANT_TICKERS en universe.py; vaciar ese dict para volver a los 205)")
+
+    if st["insufficient"]:
+        click.secho(f"\n  [!] Sin historia suficiente (<{st['min_history']} meses), "
+                    f"el loader los descarta ({len(st['insufficient'])}): "
+                    f"{st['insufficient']}", fg="red")
+
+    if st["late"]:
+        click.secho(f"\n  [i] Incluidos desde su inception (arrancan después de "
+                    f"{st['window'][0]:%Y-%m}) ({len(st['late'])}):", fg="cyan")
+        for t in sorted(st["late"], key=lambda x: st["inception"][x]):
+            click.echo(f"      {t:6} desde {st['inception'][t]:%Y-%m}  "
+                       f"({st['coverage'][t]:.0f}% de la ventana)")
+
+    click.secho(f"\n  ETFs activos en el backtest: {len(st['active'])}", bold=True)
+
+    click.secho("\n== Composición por clase de activo ==", bold=True)
+    for ac in ASSET_CLASSES:
+        n = sum(1 for t in st["active"] if ETF_UNIVERSE.get(t) == ac)
+        click.echo(f"  {ac:11} {n:3} ETFs")
 
 
 # ---------------------------------------------
@@ -153,6 +209,7 @@ def robustness(ctx, test):
 @click.pass_context
 def test_connection(ctx):
     """Verifica la conexión con IBKR TWS sin ejecutar órdenes."""
+    from src.broker.ibkr import IBKRConnection
     config = _load_config(ctx.obj["config_path"])
     broker = config["broker"]
 
@@ -181,6 +238,57 @@ def test_connection(ctx):
 
 
 # ---------------------------------------------
+# validate-ibkr
+# ---------------------------------------------
+@cli.command("validate-ibkr")
+@click.option("--out", default="logs/ibkr_validation.csv", type=str,
+              help="CSV donde guardar el resultado por ticker.")
+@click.pass_context
+def validate_ibkr(ctx, out):
+    """Verifica contra IBKR qué ETFs del universo son realmente operables."""
+    import csv
+    from pathlib import Path
+    from src.broker.ibkr import IBKRConnection
+    config = _load_config(ctx.obj["config_path"])
+    broker = config["broker"]
+    tickers = list(ETF_UNIVERSE.keys())
+
+    click.echo(f"Conectando a IBKR TWS en {broker['host']}:{broker['port']} ...")
+    conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+    try:
+        conn.connect()
+        click.echo(f"Validando {len(tickers)} ETFs contra IBKR (SMART/USD) ...")
+        results = conn.validate_tradeable(tickers)
+    finally:
+        conn.disconnect()
+
+    ok = [t for t in tickers if results.get(t, (False, ""))[0]]
+    bad = [t for t in tickers if not results.get(t, (False, ""))[0]]
+
+    if bad:
+        click.secho(f"\n[!] NO operables ({len(bad)}):", fg="red", bold=True)
+        for t in bad:
+            click.echo(f"    {t:6} {results[t][1]}  [{ETF_UNIVERSE.get(t)}]")
+    else:
+        click.secho("\n[OK] Todos los ETFs del universo son operables en IBKR.", fg="green")
+
+    click.secho(f"\nOperables: {len(ok)} / {len(tickers)}", bold=True)
+
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ticker", "asset_class", "tradeable", "detail"])
+        for t in tickers:
+            tradeable, detail = results.get(t, (False, "no consultado"))
+            w.writerow([t, ETF_UNIVERSE.get(t), int(tradeable), detail])
+    click.secho(f"Resultado guardado en {out}", fg="cyan")
+
+    if bad:
+        click.echo("\nPara dejar el universo solo con lo operable, quitar de "
+                   "universe.py:\n  " + str(bad))
+
+
+# ---------------------------------------------
 # monitor
 # ---------------------------------------------
 @cli.command("monitor")
@@ -188,6 +296,8 @@ def test_connection(ctx):
 @click.pass_context
 def monitor(ctx, interval):
     """Muestra el portafolio live conectándose a IBKR TWS."""
+    from src.broker.ibkr import IBKRConnection
+    from src.broker.monitor import stream_portfolio_updates
     config = _load_config(ctx.obj["config_path"])
     broker = config["broker"]
 
@@ -206,21 +316,26 @@ def monitor(ctx, interval):
 @cli.command("execute")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Muestra las órdenes sin ejecutarlas.")
+@click.option("--capital", default=None, type=float,
+              help="Capital a destinar en USD (default: NetLiquidation completo). "
+                   "Se acota al NetLiquidation real de la cuenta.")
 @click.pass_context
-def execute(ctx, dry_run):
+def execute(ctx, dry_run, capital):
     """Calcula el rebalanceo y ejecuta las órdenes en IBKR (o simula con --dry-run)."""
+    from src.broker.ibkr import IBKRConnection
+    from src.broker.orders import execute_rebalance
+    from src.broker.runner import compute_target_weights
     config = _load_config(ctx.obj["config_path"])
     returns = load_returns(config)
 
-    weights, _ = build_portfolio(returns, config)
-    target_weights = weights.iloc[-1].dropna()
-    target_weights = target_weights[target_weights != 0]
+    # Misma fuente de pesos que el backtest y el dashboard (incluye vol scaling).
+    target_weights = compute_target_weights(returns, config)
 
     if dry_run:
         click.secho("DRY RUN — no se ejecutarán órdenes reales.", fg="yellow")
         conn = IBKRConnection.__new__(IBKRConnection)
         conn.ib = None
-        execute_rebalance(conn, target_weights, capital=1_000_000, dry_run=True)
+        execute_rebalance(conn, target_weights, capital=capital or 1_000_000, dry_run=True)
         return
 
     broker = config["broker"]
@@ -228,11 +343,161 @@ def execute(ctx, dry_run):
     try:
         conn.connect()
         account = conn.get_account_summary()
-        capital = account.get("NetLiquidation", 1_000_000)
-        click.echo(f"Capital disponible: ${capital:,.2f}")
-        execute_rebalance(conn, target_weights, capital=capital, dry_run=False)
+        net_liq = account.get("NetLiquidation", 1_000_000)
+        # Precaución: nunca desplegar más que lo pedido ni más que el NetLiquidation.
+        deploy = min(capital, net_liq) if capital else net_liq
+        click.echo(f"NetLiquidation: ${net_liq:,.2f}  ·  Capital a destinar: ${deploy:,.2f}")
+        execute_rebalance(conn, target_weights, capital=deploy, dry_run=False)
     finally:
         conn.disconnect()
+
+
+# ---------------------------------------------
+# strategy-status / halt / resume
+# ---------------------------------------------
+@cli.command("strategy-status")
+def strategy_status():
+    """Muestra el estado de la estrategia (detenida / activa / pausada)."""
+    from src.broker import state
+    st = state.get_state()
+    status = st.get("status", "stopped")
+    chk = state.next_rebalance_date()
+    if status == "running":
+        click.secho("Estrategia: ACTIVA", fg="green", bold=True)
+        click.echo(f"  enrolada:           {st.get('enrolled_at')}")
+        click.echo(f"  parámetros:         {st.get('params')}")
+        click.echo(f"  último rebalanceo:  {st.get('last_rebalance_at') or 'nunca'}")
+        click.echo(f"  próximo rebalanceo: {chk.isoformat()}")
+        if state.rebalance_due():
+            click.secho("  [!] REBALANCEO PENDIENTE este mes -> python main.py tick", fg="yellow")
+    elif status == "paused":
+        click.secho("Estrategia: PAUSADA", fg="yellow", bold=True)
+        click.echo(f"  desde:  {st.get('halted_at')}")
+        click.echo(f"  motivo: {st.get('reason')}")
+        click.echo("  -> reanudar con: python main.py resume")
+    else:
+        click.secho("Estrategia: DETENIDA (no enrolada)", fg="white", bold=True)
+        click.echo("  -> iniciar con: python main.py start-strategy")
+
+
+@cli.command("start-strategy")
+@click.pass_context
+def start_strategy_cmd(ctx):
+    """Enrola la estrategia (status ACTIVA). El primer rebalanceo se ejecuta con 'tick'."""
+    from src.broker import state
+    config = _load_config(ctx.obj["config_path"])
+    strat = config["strategy"]
+    params = {"signal_mode": strat.get("signal_mode"),
+              "lookback": strat.get("lookback_months"),
+              "target_vol": strat.get("target_volatility")}
+    state.start_strategy(params)
+    click.secho("Estrategia ACTIVA.", fg="green", bold=True)
+    click.echo(f"  parámetros: {params}")
+    click.echo("  -> ejecutar el rebalanceo pendiente: python main.py tick")
+
+
+@cli.command("halt")
+@click.option("--reason", default="pausa manual (CLI)", help="Motivo de la pausa.")
+def halt_cmd(reason):
+    """Pausa la estrategia (bloquea rebalanceos). No cierra posiciones."""
+    from src.broker import state
+    state.pause(reason)
+    click.secho("Estrategia PAUSADA. Los rebalanceos quedan bloqueados.", fg="yellow", bold=True)
+    click.echo("Para cerrar posiciones además: python main.py close-all --execute")
+
+
+@cli.command("resume")
+def resume_cmd():
+    """Reanuda la estrategia pausada (vuelve a permitir rebalanceos)."""
+    from src.broker import state
+    state.resume()
+    click.secho("Estrategia REANUDADA (ACTIVA). Rebalanceos habilitados.", fg="green", bold=True)
+
+
+# ---------------------------------------------
+# tick  (el "termostato": chequea y, si toca, rebalancea)
+# ---------------------------------------------
+@cli.command("tick")
+@click.option("--force", is_flag=True, default=False,
+              help="Ejecuta el rebalanceo aunque no haya cambio de mes.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Solo muestra si toca rebalancear, sin ejecutar.")
+@click.option("--capital", default=None, type=float,
+              help="Capital a destinar en USD (default: NetLiquidation completo).")
+@click.pass_context
+def tick_cmd(ctx, force, dry_run, capital):
+    """Chequea si toca rebalancear y, si toca (o --force), ejecuta. Apto para cron."""
+    from src.broker import state
+    from src.broker.runner import check_rebalance, run_tick
+    from src.broker.ibkr import IBKRConnection
+    config = _load_config(ctx.obj["config_path"])
+
+    chk = check_rebalance()
+    click.secho(f"Estado: {chk.status.upper()}", bold=True)
+    click.echo(f"  {chk.reason}")
+    click.echo(f"  próximo rebalanceo: {chk.next_rebalance_date}")
+
+    if dry_run or (not chk.due and not force):
+        if not chk.due and not force:
+            click.secho("Nada que ejecutar.", fg="cyan")
+        return
+
+    if state.is_paused():
+        click.secho("Estrategia PAUSADA: no se ejecuta.", fg="yellow")
+        return
+
+    returns = load_returns(config)
+    broker = config["broker"]
+    conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+    try:
+        conn.connect()
+        net_liq = conn.get_account_summary().get("NetLiquidation", 1_000_000)
+        deploy = min(capital, net_liq) if capital else net_liq
+        click.echo(f"NetLiquidation: ${net_liq:,.2f}  ·  Capital a destinar: ${deploy:,.2f}")
+        result = run_tick(conn, returns, config, capital=deploy, force=force, trigger="cron")
+    finally:
+        conn.disconnect()
+    click.secho(result.message, fg="green" if result.executed else "cyan")
+
+
+# ---------------------------------------------
+# close-all (kill switch)
+# ---------------------------------------------
+@cli.command("close-all")
+@click.option("--execute", is_flag=True, default=False,
+              help="Ejecuta el cierre REAL. Sin este flag es dry-run.")
+@click.option("--halt/--no-halt", default=True,
+              help="Detener la estrategia tras cerrar posiciones (default: sí).")
+@click.pass_context
+def close_all(ctx, execute, halt):
+    """KILL SWITCH: cierra todas las posiciones en IBKR (dry-run por defecto)."""
+    from src.broker.ibkr import IBKRConnection
+    from src.broker.orders import close_all_positions
+    from src.broker import state
+    config = _load_config(ctx.obj["config_path"])
+    broker = config["broker"]
+
+    if not execute:
+        click.secho("DRY RUN — no se cierra nada (usá --execute para ejecutar).", fg="yellow")
+        conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+        try:
+            conn.connect()
+            close_all_positions(conn, dry_run=True)
+        finally:
+            conn.disconnect()
+        return
+
+    conn = IBKRConnection(broker["host"], broker["port"], broker["client_id"])
+    try:
+        conn.connect()
+        close_all_positions(conn, dry_run=False, reason="kill switch (CLI)")
+    finally:
+        conn.disconnect()
+    if halt:
+        state.halt("kill switch (CLI)")
+        click.secho("Posiciones cerradas y estrategia CORTADA.", fg="red", bold=True)
+    else:
+        click.secho("Posiciones cerradas.", fg="green")
 
 
 # ---------------------------------------------

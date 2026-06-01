@@ -30,6 +30,22 @@ PALETTES = {
             "text": "#c4d4df", "text-dim": "#5f7282", "text-mute": "#3c4a56", "text-faint": "#3c4a56",
             "accent": "#34d6ea", "accent-dim": "#166577", "accent-glow": "rgba(52,214,234,.45)",
             "pos": "#34e08a", "neg": "#ff5d63", "warn": "#ffb454", "info": "#4aa8ff"},
+    # Bloomberg clásico: negro absoluto + ámbar/naranja, verde/rojo para P&L.
+    "bloomberg": {**_PHOSPHOR,
+                  "bg-0": "#000000", "bg-1": "#0a0907", "bg-2": "#13110c", "bg-3": "#1d1810",
+                  "border": "#2a2114", "border-soft": "#1b150d",
+                  "grid": "rgba(255,150,40,.07)", "grid-strong": "rgba(255,150,40,.22)",
+                  "text": "#e8e1d2", "text-dim": "#8c7a57", "text-mute": "#52462f", "text-faint": "#52462f",
+                  "accent": "#ff8c1a", "accent-dim": "#7a3f00", "accent-glow": "rgba(255,140,26,.5)",
+                  "pos": "#37d67a", "neg": "#ff4d4d", "warn": "#ffb454", "info": "#4aa8ff"},
+    # Graphite: blanco/acero sobre carbón, sin color de marca — sobrio e institucional.
+    "graphite": {**_PHOSPHOR,
+                 "bg-0": "#080a0c", "bg-1": "#0f1216", "bg-2": "#161b20", "bg-3": "#1f262c",
+                 "border": "#262e35", "border-soft": "#1a2027",
+                 "grid": "rgba(180,195,210,.06)", "grid-strong": "rgba(180,195,210,.2)",
+                 "text": "#dfe6ec", "text-dim": "#7a8794", "text-mute": "#49525b", "text-faint": "#49525b",
+                 "accent": "#e6edf3", "accent-dim": "#586470", "accent-glow": "rgba(230,237,243,.28)",
+                 "pos": "#3ddc84", "neg": "#ff5d63", "warn": "#ffb454", "info": "#5aa9ff"},
 }
 
 MONO = '"IBM Plex Mono","JetBrains Mono","SF Mono",ui-monospace,Menlo,monospace'
@@ -197,6 +213,33 @@ h1,h2,h3 { font-family:var(--mono)!important; color:var(--text)!important; }
 .page-h1 { font-size:1.15rem; font-weight:700; color:var(--text); margin:2px 0 0; letter-spacing:-.01em; }
 .page-h1 .dim { color:var(--text-dim); font-weight:400; }
 .page-sub { color:var(--text-dim); font-size:10.5px; margin:3px 0 10px; letter-spacing:.3px; }
+
+/* ---- overlay de cálculo del óptimo (lookback × target vol) ---- */
+.calc-overlay {
+    position:fixed; top:0; right:0; bottom:0; left:230px; z-index:9999;
+    display:flex; align-items:center; justify-content:center;
+    background:color-mix(in srgb, var(--bg-0) 86%, transparent); backdrop-filter:blur(3px);
+    animation:calc-fade .18s ease-out;
+}
+@media (max-width:900px) { .calc-overlay { left:0; } }
+@keyframes calc-fade { from{opacity:0} to{opacity:1} }
+.calc-card {
+    background:var(--bg-1); border:1px solid var(--accent-dim); padding:34px 46px; min-width:440px; max-width:90vw;
+    box-shadow:0 0 0 1px var(--bg-0), 0 24px 70px rgba(0,0,0,.6), 0 0 40px var(--accent-glow);
+    text-align:center;
+}
+.calc-eyebrow { color:var(--text-dim); font-size:10px; letter-spacing:3px; text-transform:uppercase; margin-bottom:14px; }
+.calc-title { color:var(--accent); font-size:1.25rem; font-weight:700; letter-spacing:.5px;
+    text-shadow:0 0 16px var(--accent-glow); margin-bottom:8px; }
+.calc-sub { color:var(--text); font-size:12px; line-height:1.6; margin-bottom:22px; }
+.calc-sub b { color:var(--accent); }
+.calc-bar { height:4px; background:var(--bg-3); overflow:hidden; position:relative; }
+.calc-bar::after { content:""; position:absolute; top:0; left:0; height:100%; width:40%;
+    background:linear-gradient(90deg, transparent, var(--accent), transparent);
+    box-shadow:0 0 10px var(--accent-glow); animation:calc-sweep 1.1s ease-in-out infinite; }
+@keyframes calc-sweep { 0%{left:-40%} 100%{left:100%} }
+.calc-foot { color:var(--text-dim); font-size:10px; letter-spacing:1.5px; margin-top:14px; }
+.calc-foot .dot { width:6px; height:6px; }
 """
 
 

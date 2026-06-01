@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from .universe import ETF_UNIVERSE
+from .universe import ETF_UNIVERSE, REDUNDANT_TICKERS, EXCLUDED_TICKERS
 
 
 def load_etf_prices(path: str) -> pd.DataFrame:
@@ -48,6 +48,60 @@ def compute_monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
     return returns[known]
 
 
+def data_status(config: dict) -> dict:
+    """Diagnóstico de consistencia entre universe.py y el parquet.
+
+    Devuelve un dict con:
+      - missing:     ETFs del universo SIN datos en el parquet (hay que descargar)
+      - orphans:     columnas del parquet que NO están en el universo (datos sin usar)
+      - coverage:    % de meses con dato en la ventana, por ticker del universo
+      - inception:   primer mes con dato, por ticker
+      - active:      tickers con historia suficiente -> participan del backtest
+      - insufficient: tickers con < min_history_months -> el loader los descarta
+      - late:        tickers activos pero que arrancan después del inicio de ventana
+    """
+    prices = load_etf_prices(config["data"]["path"])
+    have = set(prices.columns)
+    uni = set(ETF_UNIVERSE.keys())
+
+    monthly = compute_monthly_returns(prices)
+    start = config["backtest"].get("start_date")
+    end = config["backtest"].get("end_date")
+    if start:
+        monthly = monthly[monthly.index >= start]
+    if end:
+        monthly = monthly[monthly.index <= end]
+
+    min_history = config.get("data", {}).get("min_history_months", 24)
+    n_obs = monthly.notna().sum()
+    coverage = (monthly.notna().mean() * 100).round(1).sort_values()
+    inception = {t: monthly[t].first_valid_index() for t in monthly.columns}
+
+    active = [t for t in coverage.index if n_obs[t] >= min_history]
+    insufficient = [t for t in coverage.index if n_obs[t] < min_history]
+    win_start = monthly.index[0] if len(monthly) else None
+    late = [t for t in active
+            if inception[t] is not None and win_start is not None
+            and inception[t] > win_start]
+
+    return {
+        "n_universe": len(uni),
+        "n_parquet": len(have),
+        "min_history": min_history,
+        "missing": sorted(uni - have),
+        # Redundantes (curación corr>=0.95) y excluidos (.MI/.TO) son exclusiones
+        # intencionales: no se reportan como orphans sorpresa.
+        "orphans": sorted(have - uni - set(REDUNDANT_TICKERS) - set(EXCLUDED_TICKERS)),
+        "redundant_present": sorted(have & set(REDUNDANT_TICKERS)),
+        "coverage": coverage,
+        "inception": inception,
+        "active": active,
+        "insufficient": insufficient,
+        "late": late,
+        "window": (monthly.index[0], monthly.index[-1]) if len(monthly) else None,
+    }
+
+
 def load_returns(config: dict) -> pd.DataFrame:
     prices = load_etf_prices(config["data"]["path"])
     returns = compute_monthly_returns(prices)
@@ -59,7 +113,11 @@ def load_returns(config: dict) -> pd.DataFrame:
     if end:
         returns = returns[returns.index <= end]
 
-    # Drop columns with >20% missing values
-    thresh = int(len(returns) * 0.8)
-    returns = returns.dropna(axis=1, thresh=thresh)
-    return returns.ffill().bfill()
+    # Cada ETF se usa DESDE SU INCEPTION: los meses previos a que existiera quedan
+    # como NaN. El pipeline (señal -> peso) ya trata el NaN como "activo inactivo"
+    # (peso 0), así que NO se rellena pre-inception (eso sería lookahead). Solo se
+    # descartan los ETFs sin historia suficiente para llegar a formar una señal.
+    min_history = config.get("data", {}).get("min_history_months", 24)
+    enough = returns.notna().sum() >= min_history
+    returns = returns.loc[:, enough]
+    return returns
