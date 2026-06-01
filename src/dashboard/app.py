@@ -124,6 +124,21 @@ def topbar(asof, lookback, target_vol, signal_type, sharpe):
     </div>"""
 
 
+def read_trades_csv(path):
+    """Lee logs/trades.csv tolerando un archivo SIN fila de header (versiones viejas
+    del logger lo escribían sin encabezado). Devuelve un DataFrame con columnas
+    nombradas y 'timestamp' parseada, o None si está vacío."""
+    from src.broker.orders import TRADE_HEADER
+    df = pd.read_csv(path)
+    if "timestamp" not in df.columns:
+        df = pd.read_csv(path, header=None, names=TRADE_HEADER)
+        df = df[df["timestamp"].astype(str) != "timestamp"]  # descarta header repetido si lo hubiera
+    if df.empty:
+        return None
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return df.dropna(subset=["timestamp"])
+
+
 def calc_overlay(signal_type, weighting, window):
     return f"""
     <div class="calc-overlay">
@@ -849,9 +864,9 @@ elif page.startswith("05"):
                 '<div class="page-sub">registro de órdenes ejecutadas</div>', unsafe_allow_html=True)
 
     log_path = os.path.join(ROOT, "logs", "trades.csv")
-    if os.path.exists(log_path) and os.path.getsize(log_path) > 1:
-        trades_df = pd.read_csv(log_path)
-        trades_df["timestamp"] = pd.to_datetime(trades_df["timestamp"])
+    trades_df = (read_trades_csv(log_path)
+                 if os.path.exists(log_path) and os.path.getsize(log_path) > 1 else None)
+    if trades_df is not None:
         n_buy = int((trades_df["action"] == "BUY").sum())
         n_sell = int((trades_df["action"] == "SELL").sum())
         strip = "".join([
@@ -896,8 +911,9 @@ elif page.startswith("06"):
                 unsafe_allow_html=True)
 
     reb_path = os.path.join(ROOT, "logs", "rebalances.csv")
-    if os.path.exists(reb_path) and os.path.getsize(reb_path) > 1:
-        reb_df = pd.read_csv(reb_path)
+    reb_df = (pd.read_csv(reb_path)
+              if os.path.exists(reb_path) and os.path.getsize(reb_path) > 1 else None)
+    if reb_df is not None and not reb_df.empty:
         reb_df["timestamp"] = pd.to_datetime(reb_df["timestamp"])
         n_reb = int((reb_df["trigger"] != "KILL").sum())
         n_kill = int((reb_df["trigger"] == "KILL").sum())
@@ -919,9 +935,9 @@ elif page.startswith("06"):
 
         # Órdenes de un rebalanceo puntual (trae trades.csv y filtra por rebalance_id)
         trades_path = os.path.join(ROOT, "logs", "trades.csv")
-        if os.path.exists(trades_path) and os.path.getsize(trades_path) > 1:
-            tdf = pd.read_csv(trades_path)
-            if "rebalance_id" in tdf.columns:
+        tdf = (read_trades_csv(trades_path)
+               if os.path.exists(trades_path) and os.path.getsize(trades_path) > 1 else None)
+        if tdf is not None and "rebalance_id" in tdf.columns:
                 rid = st.selectbox("Ver órdenes del rebalanceo",
                                    reb_df.sort_values("timestamp", ascending=False)["rebalance_id"])
                 sub = tdf[tdf["rebalance_id"] == rid]
