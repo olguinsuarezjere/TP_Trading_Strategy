@@ -3,13 +3,25 @@ import time
 
 import pandas as pd
 
-# ib_insync/eventkit llaman a asyncio.get_event_loop() AL IMPORTARSE. En un hilo que
-# no es el principal (p.ej. el ScriptRunner de Streamlit) puede no haber event loop y
-# eso explota con RuntimeError. Garantizamos uno antes de importar ib_insync.
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+
+def _ensure_event_loop() -> None:
+    """Garantiza que el HILO ACTUAL tenga un asyncio event loop usable.
+
+    ib_insync (vía eventkit) requiere un event loop en el hilo donde se instancia/
+    conecta IB(). En el ScriptRunner de Streamlit —un hilo distinto al principal y al
+    que importó este módulo— no hay loop, y conectar explota con
+    'There is no current event loop in thread ...'. Hay que crearlo en RUNTIME, en el
+    hilo actual, no solo al importar."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+# Al importar (cubre el hilo de import); en __init__ se vuelve a asegurar por-hilo.
+_ensure_event_loop()
 
 from ib_insync import IB, Stock, util  # noqa: E402
 
@@ -26,6 +38,9 @@ class IBKRConnection:
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1):
+        # Asegurar el event loop en ESTE hilo antes de crear IB() (clave para el
+        # ScriptRunner de Streamlit, que corre en un hilo sin loop).
+        _ensure_event_loop()
         self.host = host
         self.port = port
         self.client_id = client_id

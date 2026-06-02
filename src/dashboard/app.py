@@ -775,7 +775,10 @@ elif page.startswith("04"):
             st.info("Sin posiciones abiertas en la cuenta paper.")
 
         # ----- Drift: target TSMOM vs actual -----
-        cur_w = (portfolio_df.set_index("ticker")["weight"] if not portfolio_df.empty
+        # groupby (no set_index): un símbolo puede tener varios lotes/contratos
+        # (p.ej. warrants), y un índice con duplicados haría que cur_w.get() devuelva
+        # una Serie en vez de un escalar y rompa el float().
+        cur_w = (portfolio_df.groupby("ticker")["weight"].sum() if not portfolio_df.empty
                  else pd.Series(dtype=float))
         drift_rows = []
         for tk in target_weights.index.union(cur_w.index):
