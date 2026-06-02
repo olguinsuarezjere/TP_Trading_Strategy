@@ -58,9 +58,12 @@ def check_rebalance(today: date | None = None) -> RebalanceCheck:
         reason = "Estrategia detenida — no enrolada."
     elif status == "paused":
         reason = "Estrategia pausada — no opera hasta reanudar."
+    elif due and last is None:
+        reason = ("Primer rebalanceo de la estrategia: allocación inicial pendiente "
+                  "(todavía no se operó). Ejecutalo para comprar las posiciones objetivo.")
     elif due:
-        reason = (f"Rebalanceo pendiente: empezó un mes nuevo y todavía no se "
-                  f"rebalanceó (último: {last or 'nunca'}).")
+        reason = (f"Rebalanceo mensual pendiente: empezó un mes nuevo y todavía no se "
+                  f"rebalanceó este mes (último: {last}).")
     else:
         reason = f"Al día — ya se rebalanceó este mes. Próximo: {nxt.isoformat()}."
 
@@ -111,9 +114,11 @@ def run_tick(
         "lookback": config["strategy"].get("lookback_months"),
         "target_vol": config["strategy"].get("target_volatility"),
     }
-    orders = execute_rebalance(conn, target, capital=capital, dry_run=False,
-                               trigger=trigger, params=params)
+    res = execute_rebalance(conn, target, capital=capital, dry_run=False,
+                            trigger=trigger, params=params)
+    orders = res["orders"]
     # execute_rebalance ya registró el rebalanceo en el estado (state.record_rebalance).
     rid = state.get_state().get("last_rebalance_id")
-    return TickResult(True, orders=orders, rebalance_id=rid,
-                      message=f"Rebalanceo ejecutado ({len(orders)} órdenes).")
+    msg = (f"Rebalanceo ejecutado: {res['n_filled']}/{len(orders)} llenadas"
+           + (f", {len(res['skipped'])} omitidas (< 1 acción)" if res["skipped"] else ""))
+    return TickResult(True, orders=orders, rebalance_id=rid, message=msg)

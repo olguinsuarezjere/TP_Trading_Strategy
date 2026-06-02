@@ -5,10 +5,12 @@ strategy:
   max_position_weight: 0.15
   vol_com_months: 3
   # --- Señal (mejora validada en el motor real con walk-forward) ---
-  # signal_mode: binary (Moskowitz 2012) | strength (Baz 2015) | multihorizon (AQR)
+  # signal_mode: binary (Moskowitz 2012) | strength (Baz 2015) | multihorizon (Baz 2015)
   # 'strength' (señal continua normalizada por vol) sube el Sharpe 0.27 -> 0.47.
-  # multihorizon y class_balanced se probaron pero NO mejoran en este universo de ETFs
-  # (quedan disponibles como opción en el dashboard).
+  # multihorizon (blend de horizontes, Baz 2015) y class_balanced se probaron pero NO mejoran
+  # en este universo de ETFs. multihorizon se SACÓ de las opciones del dashboard (rinde peor con
+  # rebalanceo mensual); el código sigue en src/strategy/signals.py. Justificación en
+  # dashboard_walkthrough.ipynb.
   signal_mode: strength
   lookbacks: [3, 6, 12]
   # weighting: pooled (1/N global) | class_balanced (presupuesto igual por clase de activo)
@@ -25,7 +27,10 @@ transaction_costs:
 
 backtest:
   start_date: "2012-01-01"
-  end_date: "2026-05-31"
+  # end_date vacío = ventana abierta: el backtest usa hasta el último mes COMPLETO y
+  # avanza solo a medida que cierran los meses (los datos se actualizan a diario vía
+  # yfinance). Poner una fecha fija acá solo si se quiere congelar la ventana.
+  end_date: null
   initial_capital: 1_000_000
 
 data:

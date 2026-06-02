@@ -26,6 +26,36 @@ _ensure_event_loop()
 from ib_insync import IB, Stock, util  # noqa: E402
 
 
+def _classify_conn_error(e: Exception) -> str:
+    """Clasifica un fallo de conexión: 'refused' (TWS apagado/puerto cerrado = real),
+    'timeout' (TWS ocupado, transitorio), 'clientid' (id tomado, transitorio) u 'other'."""
+    msg = str(e).lower()
+    if isinstance(e, ConnectionRefusedError) or "refused" in msg:
+        return "refused"
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if "client id is already in use" in msg or "clientid" in msg or "326" in msg:
+        return "clientid"
+    return "other"
+
+
+def _user_conn_message(host: str, port: int, kind: str, e: Exception) -> str:
+    """Mensaje claro al usuario según el tipo de fallo, ya agotados los reintentos."""
+    base = f"No se pudo conectar a TWS en {host}:{port}"
+    if kind == "refused":
+        return (f"{base}: la conexión fue rechazada. Probablemente TWS o IB Gateway no "
+                f"esté abierto, o la API no esté habilitada en el puerto {port}. "
+                f"Abrí TWS y activá la API (Global Configuration → API → Settings).")
+    if kind == "timeout":
+        return (f"{base}: TWS no respondió tras varios intentos. Puede estar iniciando o "
+                f"re-autenticándose, o falta aceptar la conexión entrante / agregar "
+                f"127.0.0.1 a Trusted IPs. Esperá unos segundos y reintentá.")
+    if kind == "clientid":
+        return (f"{base}: el clientId quedó tomado por una sesión anterior que no cerró. "
+                f"Esperá unos segundos a que TWS lo libere y reintentá.")
+    return f"{base}. Asegurate de que TWS o IB Gateway esté corriendo. Error: {e}"
+
+
 class IBKRConnection:
     """
     Wrapper sobre ib_insync para conectarse a TWS Paper Trading.
@@ -46,15 +76,38 @@ class IBKRConnection:
         self.client_id = client_id
         self.ib = IB()
 
-    def connect(self) -> None:
-        try:
-            self.ib.connect(self.host, self.port, clientId=self.client_id)
-        except Exception as e:
-            raise ConnectionError(
-                f"No se pudo conectar a TWS en {self.host}:{self.port}. "
-                f"Asegurate de que TWS o IB Gateway esté corriendo. Error: {e}"
-            )
-        self._verify_connection()
+    def connect(self, retries: int = 3, timeout: float = 7.0) -> None:
+        """Conecta a TWS de forma robusta.
+
+        Reintenta los fallos TRANSITORIOS (handshake lento porque TWS está ocupado o
+        re-autenticándose; o el clientId todavía tomado por una sesión anterior que no
+        cerró limpio). Solo levanta un error al usuario cuando, tras agotar los
+        reintentos, la conexión realmente no se pudo establecer — típicamente porque
+        TWS/IB Gateway no está abierto o la API no está habilitada en el puerto."""
+        last_err = None
+        for attempt in range(1, retries + 1):
+            try:
+                self.ib.connect(self.host, self.port, clientId=self.client_id, timeout=timeout)
+                self._verify_connection()
+                return
+            except Exception as e:
+                last_err = e
+                kind = _classify_conn_error(e)
+                # Dejar el socket limpio antes de reintentar.
+                try:
+                    if self.ib.isConnected():
+                        self.ib.disconnect()
+                except Exception:
+                    pass
+                if attempt < retries:
+                    # clientId tomado por una sesión vieja: probar con uno alternativo.
+                    if kind == "clientid":
+                        self.client_id += 100
+                    print(f"[IBKR] intento {attempt}/{retries} falló ({kind}); reintentando…")
+                    time.sleep(min(1.0 * attempt, 3.0))  # backoff incremental
+                    continue
+                # Reintentos agotados -> error real al usuario.
+                raise ConnectionError(_user_conn_message(self.host, self.port, kind, e))
 
     def _verify_connection(self) -> None:
         if not self.ib.isConnected():
@@ -208,8 +261,15 @@ class IBKRConnection:
         NO llamamos reqAccountUpdates(): ib_insync ya auto-suscribe las actualizaciones
         de cuenta al conectar, así que ib.portfolio() ya está poblado. Llamar
         reqAccountUpdates() con cuenta única y account='' se CUELGA esperando un
-        accountDownloadEnd que no llega."""
-        self.ib.sleep(settle)
+        accountDownloadEnd que no llega.
+
+        Espera ADAPTATIVA: en vez de dormir `settle` fijo, espera solo hasta que lleguen
+        los datos de cuenta (señal de que el download terminó), con ese tope. Como
+        connect() ya sincroniza la cuenta, normalmente sale al instante."""
+        waited = 0.0
+        while waited < settle and not self.ib.accountValues():
+            self.ib.sleep(0.2)
+            waited += 0.2
         rows = []
         for it in self.ib.portfolio():
             if abs(it.position) < 1e-9:

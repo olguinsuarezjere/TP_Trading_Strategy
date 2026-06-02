@@ -46,20 +46,68 @@ def _load_returns(config_str: str):
 
 
 @st.cache_data(show_spinner="Corriendo backtest…")
-def _run_backtest(config_str: str, signal_type: str):
+def _run_backtest(config_str: str, signal_type: str, data_token: str = ""):
+    # data_token (= último mes completo) entra en la cache key: el backtest se recalcula
+    # cuando cierra un mes nuevo, no en cada update diario ni en reruns sueltos.
     config = yaml.safe_load(config_str)
     returns = load_returns(config)
     results = BacktestEngine(config).run(returns, use_signal_strength=(signal_type == "strength"))
     return results, returns
 
 
-@st.cache_data(show_spinner="Optimizando Sharpe (lookback × target vol)…")
-def _optimal_params(base_config_str: str):
-    """(lookback, target_vol) que maximizan el Sharpe para la señal/ponderación dadas."""
+_OPT_CACHE = os.path.join(ROOT, "logs", "opt_cache.json")
+
+
+def _opt_disk_cached(base_config_str: str, data_token: str):
+    """Optimización con caché EN DISCO: persiste entre reinicios del dashboard. La
+    grilla (lookback × target vol) tarda ~8s, pero solo depende de señal/ponderación
+    y de los datos — así que se guarda en disco y solo se recalcula si esos cambian
+    (no en cada reinicio). Clave = hash(config base + último mes completo)."""
+    import hashlib
+    import json
+    key = hashlib.md5((base_config_str + "|" + str(data_token)).encode()).hexdigest()
+    cache = {}
+    if os.path.exists(_OPT_CACHE):
+        try:
+            cache = json.load(open(_OPT_CACHE))
+        except Exception:
+            cache = {}
+    if key in cache:
+        return cache[key]
     config = yaml.safe_load(base_config_str)
     returns = load_returns(config)
     best, _ = optimize_sharpe(returns, config)
+    best = {"lookback": int(best["lookback"]), "target_vol": float(best["target_vol"]),
+            "sharpe": float(best["sharpe"])}    # nativos para JSON
+    cache[key] = best
+    try:
+        os.makedirs(os.path.dirname(_OPT_CACHE), exist_ok=True)
+        json.dump(cache, open(_OPT_CACHE, "w"))
+    except Exception:
+        pass
     return best
+
+
+@st.cache_data(show_spinner="Optimizando Sharpe (lookback × target vol)…")
+def _optimal_params(base_config_str: str, data_token: str = ""):
+    """(lookback, target_vol) que maximizan el Sharpe para la señal/ponderación dadas.
+    data_token (= último mes completo) invalida la cache cuando cierra un mes nuevo.
+    Caché en memoria (sesión) + en disco (entre reinicios)."""
+    return _opt_disk_cached(base_config_str, data_token)
+
+
+@st.cache_data(show_spinner="Actualizando datos de mercado (yfinance)…")
+def _refresh_market_data(day_token: str, prices_path: str):
+    """Baja precios nuevos de yfinance UNA VEZ por día (cache keyed por fecha).
+    Incremental: solo agrega los días faltantes al parquet. Si falla la red,
+    no rompe el dashboard — devuelve el estado y se sigue con los datos existentes."""
+    from src.data.loader import update_prices
+    from src.data.universe import _ALL_ETFS  # universo crudo completo (mantiene el parquet entero)
+    try:
+        df = update_prices(prices_path, tickers=list(_ALL_ETFS.keys()))
+        return {"ok": True, "last": str(df.index[-1].date()), "rows": int(len(df))}
+    except Exception as e:  # red caída, rate-limit, etc.
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 # ============================================================ HELPERS
@@ -81,6 +129,18 @@ def usd(x, d=0):
 
 def tone(x):
     return "pos" if x >= 0 else "neg"
+
+
+def portfolio_vol(weights, returns_df):
+    """Volatilidad anualizada estimada de un portafolio dados los pesos y la
+    covarianza histórica (mensual) de los retornos. weights: Series ticker->peso."""
+    common = [t for t in weights.index if t in returns_df.columns]
+    if len(common) < 2:
+        return float("nan")
+    w = weights.reindex(common).fillna(0.0).values
+    cov = returns_df[common].cov().values          # covarianza mensual
+    var_m = float(w @ cov @ w)
+    return (max(var_m, 0.0) * 12) ** 0.5           # anualizada
 
 
 def kpi(label, value, delta="", value_cls="", delta_cls="tone-dim"):
@@ -156,6 +216,22 @@ def calc_overlay(signal_type, weighting, window):
     </div>"""
 
 
+def data_overlay():
+    return """
+    <div class="calc-overlay">
+      <div class="calc-card">
+        <div class="calc-eyebrow">TSMOM · SINCRONIZACIÓN DE DATOS</div>
+        <div class="calc-title">Actualizando datos de mercado</div>
+        <div class="calc-sub">
+          Descargando los precios más recientes de los ETFs<br>
+          para correr el backtest con la información al día
+        </div>
+        <div class="calc-bar"></div>
+        <div class="calc-foot"><span class="dot"></span>conectando con el proveedor de datos…</div>
+      </div>
+    </div>"""
+
+
 def panel(title, body, sub="", right=""):
     sub_h = f'<span class="panel-sub">{sub}</span>' if sub else ""
     right_h = f'<div class="panel-sub">{right}</div>' if right else ""
@@ -194,8 +270,33 @@ with st.sidebar:
 
     config = _load_config()
 
+    # --- Actualización diaria de datos (se dispara al abrir el dashboard) ---
+    # Refresca el parquet con los precios más recientes de yfinance, UNA vez por día.
+    # Se pinta el overlay grande mientras descarga; Streamlit solo lo muestra si el
+    # update realmente bloquea (cache fría/primer ingreso del día) y lo limpia al terminar.
+    # Si la red falla, sigue con lo que ya hay.
+    from datetime import date
+    from src.data.loader import last_complete_month_end
+    prices_path = os.path.join(ROOT, config["data"]["path"])
+    opt_overlay.markdown(data_overlay(), unsafe_allow_html=True)
+    data_refresh = _refresh_market_data(date.today().isoformat(), prices_path)  # 1x por día
+    opt_overlay.empty()
+    # Cache key del óptimo/backtest = ÚLTIMO MES COMPLETO (mes-granular). La estrategia
+    # es mensual, así que los retornos solo cambian cuando cierra un mes nuevo: el óptimo
+    # se recalcula SOLO entonces, NO en cada update diario ni en cada rerun (ej. apretar
+    # "Test conexión" en Live Portfolio, que antes lo recalculaba por usar el mtime del parquet).
+    data_token = last_complete_month_end()
+
+    # Ventana abierta: fijamos end_date al último mes COMPLETO (auto-avanza mes a mes).
+    # Concreto en el config en memoria => sirve para los displays y entra en la cache key.
+    config["backtest"]["end_date"] = last_complete_month_end()
+
     # Señal y ponderación van primero: el óptimo de (lookback, target vol) depende de ellas.
-    signal_type = st.radio("Señal", ["strength", "binary", "multihorizon"], horizontal=True)
+    # 'multihorizon' (Baz et al. 2015) quedó FUERA de las opciones operables: su esquema está
+    # pensado para tendencias rápidas con datos diarios y rinde peor en nuestro rebalanceo mensual
+    # sobre ETF (ver justificación en dashboard_walkthrough.ipynb). El código sigue disponible en
+    # src/strategy/signals.py por si se quisiera retomar.
+    signal_type = st.radio("Señal", ["strength", "binary"], horizontal=True)
     weighting = st.radio("Ponderación", ["pooled", "class_balanced"], horizontal=True)
 
     # Óptimo in-sample (maximiza Sharpe) para la señal/ponderación elegidas.
@@ -206,7 +307,7 @@ with st.sidebar:
     # cálculo bloquea (cache frío / reinicio) y lo limpia apenas termina.
     opt_window = f'{config["backtest"]["start_date"][:4]}–{config["backtest"]["end_date"][:4]}'
     opt_overlay.markdown(calc_overlay(signal_type, weighting, opt_window), unsafe_allow_html=True)
-    opt = _optimal_params(yaml.dump(base_cfg))
+    opt = _optimal_params(yaml.dump(base_cfg), data_token)
     opt_overlay.empty()
 
     # Default = óptimo. Se fija al óptimo al abrir el dashboard y cada vez que cambia
@@ -242,16 +343,21 @@ with st.sidebar:
     config_str = yaml.dump(config)
 
     win = f'{config["backtest"]["start_date"][:7]} → {config["backtest"]["end_date"][:7]}'
+    if data_refresh.get("ok"):
+        datos_html = f'<b class="tone-accent">↻ {data_refresh["last"]}</b>'
+    else:
+        datos_html = '<b class="tone-neg">sin conexión</b>'
     st.markdown(
         f'<div class="side-foot">'
         f'<div class="foot-row"><span>UNIVERSO</span><b>{len(ETF_UNIVERSE)} ETF</b></div>'
         f'<div class="foot-row"><span>REBAL</span><b>MENSUAL</b></div>'
         f'<div class="foot-row"><span>VENTANA</span><b>{win}</b></div>'
+        f'<div class="foot-row"><span>DATOS</span>{datos_html}</div>'
         f'<div class="foot-row"><span>CAPITAL</span><b>$1.00M</b></div></div>',
         unsafe_allow_html=True)
 
 # Datos compartidos
-results, returns = _run_backtest(config_str, signal_type)
+results, returns = _run_backtest(config_str, signal_type, data_token)
 r = results.portfolio_returns
 equity = (1 + r).cumprod()
 sharpe = sharpe_ratio(r)
@@ -573,14 +679,45 @@ elif page.startswith("04"):
             info = conn.get_connection_info()
             if execute_due and _state.is_running() and _state.rebalance_due():
                 capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
-                orders = execute_rebalance(conn, target_weights, capital=capital,
-                                           dry_run=False, trigger="auto", params=reb_params)
-                auto_msg = f"Auto-trade ejecutó {len(orders)} órdenes con capital {usd(capital)}."
+                res = execute_rebalance(conn, target_weights, capital=capital,
+                                        dry_run=False, trigger="auto", params=reb_params)
+                auto_msg = (f"Auto-trade: {res['n_filled']}/{len(res['orders'])} órdenes "
+                            f"llenadas con {usd(capital)}"
+                            + (f" · {len(res['skipped'])} omitidas (< 1 acción)" if res["skipped"] else ""))
             portfolio_df = get_live_portfolio(conn)
             account = conn.get_account_summary()
             pnl = compute_live_pnl(portfolio_df)
+        # P&L ACUMULADO real de la estrategia (realizado + no realizado):
+        #   = valor de mercado (con signo) de las posiciones − net_deployed
+        # Continuo entre rebalanceos. La primera vez (net_deployed=0 con posiciones
+        # pre-existentes) se inicializa desde el costo base para no contar el capital
+        # como ganancia.
+        _sdf = (portfolio_df[portfolio_df["ticker"].isin(ETF_UNIVERSE)]
+                if not portfolio_df.empty else portfolio_df)
+        invested = float(_sdf["market_value"].abs().sum()) if not _sdf.empty else 0.0
+        signed_mv = float(_sdf["market_value"].sum()) if not _sdf.empty else 0.0
+        net_dep = float(_state.get_state().get("net_deployed", 0.0))
+        if net_dep == 0.0 and not _sdf.empty:
+            net_dep = float((_sdf["qty"] * _sdf["avg_cost"]).sum())   # init costo base
+            _state.set_net_deployed(net_dep)
+        cum_pnl = signed_mv - net_dep
+        # Drift total actual (fracción del portafolio a reasignar para volver al target).
+        _tgt_pct = target_weights / (float(target_weights.abs().sum()) or 1.0)
+        _curw = ((_sdf.groupby("ticker")["market_value"].sum() / invested)
+                 if (not _sdf.empty and invested) else pd.Series(dtype=float))
+        drift_total = float(sum(abs(float(_tgt_pct.get(k, 0.0)) - float(_curw.get(k, 0.0)))
+                                for k in _tgt_pct.index.union(_curw.index))) / 2
         st.session_state["live"] = {"account": account, "portfolio": portfolio_df,
-                                    "pnl": pnl, "info": info, "ts": _time.strftime("%H:%M:%S")}
+                                    "pnl": pnl, "info": info, "invested": invested,
+                                    "cum_pnl": cum_pnl, "drift_total": drift_total,
+                                    "ts": _time.strftime("%H:%M:%S")}
+        # Foto del rendimiento ACUMULADO + drift para el gráfico (persiste entre sesiones).
+        if invested > 0:
+            try:
+                from src.broker.orders import log_nav_snapshot
+                log_nav_snapshot(invested, cum_pnl, drift_total)
+            except Exception:
+                pass
         if auto_msg:
             st.session_state["auto_msg"] = auto_msg
 
@@ -590,11 +727,10 @@ elif page.startswith("04"):
                                              "ts": _time.strftime("%H:%M:%S")}
 
     # ====================================================== PANEL DE CONEXIÓN
-    cc1, cc2, cc3, cc4 = st.columns([1, 1, 1, 1])
+    cc1, cc2, cc3 = st.columns([1, 1, 1])
     test_now = cc1.button("🔌 Test conexión")
-    refresh_now = cc2.button("🔄 Actualizar portafolio")
-    auto_refresh = cc3.toggle("Auto-refresh", value=False)
-    interval_secs = cc4.number_input("Intervalo (seg)", 10, 300, 30, 10, disabled=not auto_refresh)
+    auto_refresh = cc2.toggle("Auto-refresh", value=False)
+    interval_secs = cc3.number_input("Intervalo (seg)", 10, 300, 30, 10, disabled=not auto_refresh)
 
     if test_now:
         try:
@@ -638,24 +774,63 @@ elif page.startswith("04"):
                           '</div>', sub=f"{broker['host']}:{broker['port']}"), unsafe_allow_html=True)
 
     # ====================================================== CAPITAL A DESTINAR
+    def _miles(x):
+        """Formato con punto de miles (es-AR): 100000 -> '100.000'."""
+        return f"{int(round(float(x))):,}".replace(",", ".")
+
     _net_liq = (st.session_state.get("live") or {}).get("account", {}).get("NetLiquidation")
-    cap_c1, cap_c2 = st.columns([1, 1.4])
-    _cap_default = float(st.session_state.get("capital_deploy")
-                         or (_net_liq if _net_liq else config["backtest"]["initial_capital"]))
-    capital_deploy = cap_c1.number_input(
-        "💰 Capital a destinar (USD)", min_value=1_000.0,
-        max_value=float(_net_liq) if _net_liq else 100_000_000.0,
-        value=min(_cap_default, float(_net_liq)) if _net_liq else _cap_default,
-        step=1_000.0, key="capital_deploy",
+    # Tope: el NetLiquidation real si está conectado; si no, el capital del config.
+    _cap_max = max(int(_net_liq) if _net_liq else int(config["backtest"]["initial_capital"]), 2_000)
+    _init_cap = int(float(st.session_state.get("capital_deploy")
+                          or (_net_liq if _net_liq else config["backtest"]["initial_capital"])))
+
+    # 'capital_deploy' es el valor CANÓNICO (lo lee _deploy_capital). 'cap_input' y
+    # 'cap_slider' son los dos widgets enlazados: cualquiera actualiza al canónico
+    # y sincroniza al otro (campo con Enter + slider, siempre en el mismo número).
+    st.session_state.setdefault("capital_deploy", _init_cap)
+    st.session_state.setdefault("cap_input", st.session_state.capital_deploy)
+    st.session_state.setdefault("cap_slider", st.session_state.capital_deploy)
+    for _k in ("capital_deploy", "cap_input", "cap_slider"):   # acotar al rango actual
+        st.session_state[_k] = min(max(int(st.session_state[_k]), 1_000), _cap_max)
+
+    def _cap_from_input():
+        st.session_state.capital_deploy = int(st.session_state.cap_input)
+        st.session_state.cap_slider = int(st.session_state.cap_input)
+
+    def _cap_from_slider():
+        st.session_state.capital_deploy = int(st.session_state.cap_slider)
+        st.session_state.cap_input = int(st.session_state.cap_slider)
+
+    st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                'CAPITAL A DESTINAR <span class="panel-sub">cuánto desplegar en esta '
+                'operación</span></div></div>', unsafe_allow_html=True)
+    cap_c1, cap_c2 = st.columns([1, 1.25])
+    # Campo para escribir el monto (se aplica con Enter)…
+    cap_c1.number_input(
+        "Monto en USD (escribí y Enter)", min_value=1_000, max_value=_cap_max,
+        step=1_000, format="%d", key="cap_input", on_change=_cap_from_input,
         help="Cuánta plata querés que la estrategia despliegue. Nunca opera por encima "
              "de este monto ni del NetLiquidation real de la cuenta.")
+    # …o ajustar con el slider (se actualiza al instante, sin Enter).
+    cap_c1.slider(
+        "…o ajustá con el slider", min_value=1_000, max_value=_cap_max,
+        step=1_000, format="$%d", key="cap_slider", on_change=_cap_from_slider)
+    capital_deploy = int(st.session_state.capital_deploy)
     if _net_liq:
         _pctnl = capital_deploy / _net_liq * 100
-        cap_c2.caption(f"De **{usd(_net_liq)}** disponibles en la cuenta → desplegás "
-                       f"**{usd(capital_deploy)}** (**{_pctnl:.0f}%**). El resto queda en cash.")
+        sub = (f'{_pctnl:.0f}% de <b>$ {_miles(_net_liq)}</b> disponibles · '
+               f'el resto queda en cash')
     else:
-        cap_c2.caption("Conectá / actualizá el portafolio para acotar este monto al "
-                       "NetLiquidation real de tu cuenta.")
+        sub = 'conectá / actualizá el portafolio para acotarlo al NetLiquidation real'
+    cap_c2.markdown(
+        f'<div style="padding:2px 0 0 4px">'
+        f'<div class="panel-sub" style="margin-bottom:2px">Vas a desplegar</div>'
+        f'<div style="font-family:\'JetBrains Mono\',\'IBM Plex Mono\',monospace;'
+        f'font-size:2.4rem;font-weight:700;color:var(--accent);line-height:1.05;'
+        f'letter-spacing:.5px">$ {_miles(capital_deploy)}</div>'
+        f'<div class="panel-sub" style="margin-top:4px">{sub}</div></div>',
+        unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ====================================================== ESTRATEGIA (estado)
     auto_trade = st.toggle("⚡ Auto-trade — ejecutar el rebalanceo mensual solo (respeta pausa/kill)",
@@ -663,20 +838,6 @@ elif page.startswith("04"):
                            help="Si está activo y la estrategia está ACTIVA, cuando empieza un mes "
                                 "nuevo el dashboard ejecuta el rebalanceo automáticamente al actualizar. "
                                 "Si está apagado, te avisa y vos confirmás.")
-
-    # Actualizar portafolio. Auto-trade solo ejecuta órdenes en un refresh real
-    # (manual o auto-refresh); el "Test conexión" nunca opera, solo monitorea.
-    try:
-        if refresh_now or auto_refresh:
-            _fetch_live(execute_due=auto_trade)
-        elif test_now and info:
-            _fetch_live(execute_due=False)
-    except Exception as e:
-        st.error(f"Error al traer el portafolio de IBKR: {e}")
-
-    _am = st.session_state.pop("auto_msg", None)
-    if _am:
-        st.success("⚡ " + _am)
 
     strat = _state.get_state()
     chk = check_rebalance()
@@ -696,168 +857,297 @@ elif page.startswith("04"):
         p = strat.get("params", {})
         pstr = (f'{str(p.get("signal_mode","?")).upper()} · LB{p.get("lookback","?")} · '
                 f'TV{int(float(p.get("target_vol",0))*100)}%' if p else "—")
-        last_rb = strat.get("last_rebalance_at") or "nunca"
-        banner = (
+        last_rb = strat.get("last_rebalance_at")
+        last_txt = last_rb if last_rb else "todavía sin operar"
+        st.markdown(
             f'<div class="panel" style="border-color:{color}"><div class="panel-body">'
-            f'<b style="color:{color}">{label}</b> desde <b>{enrolled}</b> · {pstr}<br>'
-            f'<span class="mrow-k">Último rebalanceo:</span> {last_rb} · '
-            f'<span class="mrow-k">Próximo:</span> {chk.next_rebalance_date}</div></div>')
-        st.markdown(banner, unsafe_allow_html=True)
+            f'<b style="color:{color}">{label}</b> desde <b>{enrolled}</b> · {pstr} · '
+            f'<span class="mrow-k">última ejecución:</span> {last_txt}</div></div>',
+            unsafe_allow_html=True)
 
         sc1, sc2 = st.columns(2)
-        if strat["status"] == "running" and sc1.button("⏸ Pausar estrategia"):
+        if strat["status"] == "running" and sc1.button("⏸ Pausar estrategia", use_container_width=True):
             _state.pause("pausa manual (dashboard)")
             st.rerun()
-        if strat["status"] == "paused" and sc1.button("▶ Reanudar estrategia", type="primary"):
+        if strat["status"] == "paused" and sc1.button("▶ Reanudar estrategia", type="primary",
+                                                       use_container_width=True):
             _state.resume()
             st.rerun()
+        refresh_now = sc2.button("🔄 Actualizar portafolio", use_container_width=True)
 
-        # ----- Catch-up: rebalanceo pendiente (mes nuevo / primer rebalanceo) -----
-        if chk.due:
-            st.markdown(
-                f'<div class="panel" style="border-color:#e0a23b"><div class="panel-body" '
-                f'style="color:#e0a23b">⚠️ <b>REBALANCEO PENDIENTE</b> — {chk.reason} '
-                f'Revisalo y ejecutalo cuando quieras.</div></div>', unsafe_allow_html=True)
-            uc1, uc2 = st.columns(2)
-            if uc1.button("🔍 Ver órdenes del pendiente"):
-                from src.broker.orders import execute_rebalance
-                cap = _deploy_capital((st.session_state.get("live") or {}).get("account", {}).get("NetLiquidation", 1_000_000))
-                st.session_state["dry_run_orders"] = execute_rebalance(
-                    None, target_weights, capital=cap, dry_run=True)
-            if not _state.is_paused() and uc2.button("✅ Ejecutar rebalanceo pendiente", type="primary"):
-                from src.broker.orders import execute_rebalance
-                try:
-                    with ibkr_session(config, "rebalance") as conn:
-                        capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
-                        execute_rebalance(conn, target_weights, capital=capital,
-                                          dry_run=False, trigger="catchup", params=reb_params)
-                    st.session_state.pop("dry_run_orders", None)
-                    st.success(f"Rebalanceo pendiente ejecutado. Capital: {usd(capital)}")
-                    _fetch_live()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error al ejecutar el pendiente: {e}")
-        elif strat["status"] == "running":
-            st.caption(f"✓ {chk.reason}")
+        # Traer el portafolio en vivo (auto-trade solo en un refresh real, manual o
+        # auto-refresh; "Test conexión" nunca opera, solo monitorea).
+        try:
+            if refresh_now or auto_refresh:
+                _fetch_live(execute_due=auto_trade)
+            elif test_now and info:
+                _fetch_live(execute_due=False)
+        except Exception as e:
+            st.error(f"Error al traer el portafolio de IBKR: {e}")
+        _am = st.session_state.pop("auto_msg", None)
+        if _am:
+            st.success("⚡ " + _am)
 
-    live = st.session_state.get("live")
+        live = st.session_state.get("live")
 
-    # ====================================================== PORTAFOLIO EN VIVO
-    if live:
-        account = live["account"]
-        portfolio_df = live["portfolio"]
-        pnl = live["pnl"]
-        st.caption(f"Portafolio actualizado: {live['ts']} · cuenta paper IBKR")
+        # ===================== BLOQUE 1 · EJECUTAR ESTRATEGIA =====================
+        # Frame claro según el momento (sin jerga de "rebalanceo pendiente"):
+        if last_rb is None:                       # nunca operó -> allocación inicial
+            exec_sub, exec_btn = "allocación inicial", "▶ Ejecutar estrategia"
+            exec_note = ("La estrategia está activa pero <b>todavía no operó</b>. Al ejecutar, "
+                         "compra las posiciones objetivo del modelo TSMOM con el capital de arriba.")
+        elif chk.due:                             # mes nuevo -> rebalanceo del mes
+            exec_sub, exec_btn = "rebalanceo del mes", "▶ Ejecutar rebalanceo del mes"
+            exec_note = ("Empezó un mes nuevo: ejecutá para <b>ajustar las posiciones</b> al "
+                         "target TSMOM actualizado de este mes.")
+        else:                                     # ya operó este mes
+            exec_sub, exec_btn = f"al día · próxima {chk.next_rebalance_date}", "↻ Volver a ejecutar ahora"
+            exec_note = (f"✓ Ya se ejecutó este mes (última: <b>{last_rb}</b>). La próxima "
+                         f"ejecución programada es el <b>{chk.next_rebalance_date}</b>. Podés "
+                         f"volver a ejecutar manualmente para forzar el ajuste.")
 
-        strip = "".join([
-            kpi("Net Liquidation", usd(account.get("NetLiquidation", 0))),
-            kpi("Cash", usd(account.get("TotalCashValue", 0))),
-            kpi("Unrealized P&L", usd(pnl.get("total_unrealized_pnl", 0)), "",
-                "", f"tone-{tone(pnl.get('total_unrealized_pnl', 0))}"),
-            kpi("Posiciones", f"{pnl.get('n_positions', 0)}", f"{pnl.get('n_long',0)}L · {pnl.get('n_short',0)}S"),
-            kpi("Buying Power", usd(account.get("NetLiquidation", 0) * 2)),
-        ])
-        st.markdown(f'<div class="kpi-strip">{strip}</div>', unsafe_allow_html=True)
-
-        # ----- Posiciones abiertas -----
-        if not portfolio_df.empty:
-            pdf = portfolio_df.copy()
-            pdf["asset_class"] = pdf["ticker"].map(ETF_UNIVERSE)
-            st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                        'POSICIONES ABIERTAS <span class="panel-sub">tiempo real</span></div></div>',
-                        unsafe_allow_html=True)
-            st.dataframe(
-                pdf[["ticker", "asset_class", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
-                .sort_values("market_value", ascending=False),
-                use_container_width=True, hide_index=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.info("Sin posiciones abiertas en la cuenta paper.")
-
-        # ----- Drift: target TSMOM vs actual -----
-        # groupby (no set_index): un símbolo puede tener varios lotes/contratos
-        # (p.ej. warrants), y un índice con duplicados haría que cur_w.get() devuelva
-        # una Serie en vez de un escalar y rompa el float().
-        cur_w = (portfolio_df.groupby("ticker")["weight"].sum() if not portfolio_df.empty
-                 else pd.Series(dtype=float))
-        drift_rows = []
-        for tk in target_weights.index.union(cur_w.index):
-            tw = float(target_weights.get(tk, 0.0))
-            cw = float(cur_w.get(tk, 0.0))
-            drift_rows.append({"ticker": tk, "asset_class": ETF_UNIVERSE.get(tk, "—"),
-                               "target_w": round(tw, 4), "current_w": round(cw, 4),
-                               "drift": round(tw - cw, 4)})
-        drift_df = pd.DataFrame(drift_rows)
-        drift_df["abs"] = drift_df["drift"].abs()
-        drift_df = drift_df.sort_values("abs", ascending=False).drop(columns="abs")
-        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'DRIFT — TARGET TSMOM vs ACTUAL <span class="panel-sub">'
-                    'qué hace falta operar para alcanzar el target</span></div></div>',
-                    unsafe_allow_html=True)
-        st.dataframe(drift_df.head(25), use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ----- Rebalanceo manual (override — funciona aunque no estés enrolado) -----
-        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'REBALANCEO MANUAL <span class="panel-sub">'
-                    f'override · {len(target_weights)} posiciones objetivo</span></div></div>',
-                    unsafe_allow_html=True)
-        cd, ce = st.columns(2)
-        if cd.button("🔍 Dry Run — Ver órdenes"):
+        st.markdown(
+            f'<div class="panel"><div class="panel-head"><div class="panel-title">'
+            f'▶ EJECUTAR ESTRATEGIA <span class="panel-sub">{len(target_weights)} posiciones '
+            f'objetivo · {exec_sub}</span></div></div>'
+            f'<div class="panel-body">{exec_note}</div>', unsafe_allow_html=True)
+        ec1, ec2 = st.columns(2)
+        if ec1.button("🔍 Ver órdenes"):
             from src.broker.orders import execute_rebalance
-            cap = _deploy_capital(account.get("NetLiquidation", 1_000_000))
-            st.session_state["dry_run_orders"] = execute_rebalance(
+            cap = _deploy_capital((st.session_state.get("live") or {}).get("account", {}).get("NetLiquidation", 1_000_000))
+            st.session_state["dry_run_res"] = execute_rebalance(
                 None, target_weights, capital=cap, dry_run=True)
-        if st.session_state.get("dry_run_orders"):
-            st.dataframe(pd.DataFrame(st.session_state["dry_run_orders"]),
-                         use_container_width=True, hide_index=True)
-
         if _state.is_paused():
             st.warning("⏸ Estrategia pausada: reanudala (arriba) para poder ejecutar.")
-        else:
-            st.warning("⚠️ El botón de abajo ejecuta órdenes REALES en tu cuenta paper "
-                       "y registra el rebalanceo.")
-            if ce.button("🚀 Ejecutar en IBKR", type="primary"):
-                from src.broker.orders import execute_rebalance
+        elif ec2.button(exec_btn, type="primary"):
+            from src.broker.orders import execute_rebalance
+            # Panel de progreso en vivo: cada mensaje del backend se escribe acá.
+            with st.status("Ejecutando operaciones…", expanded=True) as status_box:
                 try:
+                    cb = lambda m: status_box.write(f"• {m}")
                     with ibkr_session(config, "rebalance") as conn:
                         capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
-                        execute_rebalance(conn, target_weights, capital=capital,
-                                          dry_run=False, trigger="dashboard", params=reb_params)
-                    st.success(f"Rebalanceo ejecutado y registrado. Capital: {usd(capital)}")
-                    st.session_state.pop("dry_run_orders", None)
+                        res = execute_rebalance(conn, target_weights, capital=capital,
+                                                dry_run=False, trigger="dashboard",
+                                                params=reb_params, on_progress=cb)
+                    st.session_state.pop("dry_run_res", None)
+                    st.session_state["last_exec"] = {**res, "capital": capital}
+                    msg = f"✓ Todo operado: {res['n_filled']}/{len(res['orders'])} órdenes llenadas"
+                    if res["n_pending"]:
+                        msg += f" · {res['n_pending']} sin confirmar (revisá en unos seg)"
+                    status_box.update(label=msg, state="complete", expanded=False)
                     _fetch_live()
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Error al ejecutar: {e}")
+                    status_box.update(label=f"Error al ejecutar: {e}", state="error")
+
+        # Resumen de la última ejecución (incluye las órdenes omitidas por < 1 acción).
+        le = st.session_state.get("last_exec")
+        if le:
+            st.success(f"Última ejecución: {le['n_filled']}/{len(le['orders'])} órdenes "
+                       f"llenadas con {usd(le['capital'])} · nada pendiente"
+                       if not le["n_pending"] else
+                       f"Última ejecución: {le['n_filled']}/{len(le['orders'])} llenadas, "
+                       f"{le['n_pending']} sin confirmar")
+            if le.get("skipped"):
+                with st.expander(f"ℹ️ {len(le['skipped'])} posiciones se omitieron (daban < 1 acción con este capital)"):
+                    st.caption("Su peso objetivo × capital / precio daba menos de 1 acción, "
+                               "y no se pueden comprar fracciones. Con más capital entrarían.")
+                    st.dataframe(pd.DataFrame(le["skipped"]), use_container_width=True, hide_index=True)
+
+        # Vista previa (dry-run): órdenes que se enviarían + las que se omitirían.
+        dr = st.session_state.get("dry_run_res")
+        if dr:
+            st.caption(f"Vista previa: {len(dr['orders'])} órdenes a enviar"
+                       + (f" · {len(dr['skipped'])} se omitirían (< 1 acción)" if dr["skipped"] else ""))
+            if dr["orders"]:
+                st.dataframe(pd.DataFrame(dr["orders"]), use_container_width=True, hide_index=True)
+            if dr["skipped"]:
+                with st.expander(f"ℹ️ {len(dr['skipped'])} posiciones omitidas (< 1 acción)"):
+                    st.dataframe(pd.DataFrame(dr["skipped"]), use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ----- KILL SWITCH -----
+        # ===================== BLOQUE 2 · MONITOREAR ESTRATEGIA ACTIVA ============
+        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                    '📊 MONITOREAR ESTRATEGIA ACTIVA <span class="panel-sub">'
+                    'posiciones · P&L · drift en vivo</span></div></div>', unsafe_allow_html=True)
+        if not live:
+            st.info("Apretá «🔄 Actualizar portafolio» arriba (o activá Auto-refresh) para ver "
+                    "posiciones, P&L y drift en vivo.")
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            portfolio_df = live["portfolio"]
+            # SOLO las posiciones de la estrategia (universo de ETFs). Excluye warrants
+            # y cualquier otra tenencia ajena: queremos el dinero y el P&L de NUESTRA
+            # estrategia, no de la cartera entera.
+            if not portfolio_df.empty:
+                strat_df = portfolio_df[portfolio_df["ticker"].isin(ETF_UNIVERSE)].copy()
+            else:
+                strat_df = portfolio_df
+
+            invested = float(live.get("invested", 0.0))
+            # P&L ACUMULADO (realizado + no realizado), calculado en _fetch_live.
+            strat_pnl = float(live.get("cum_pnl", 0.0))
+            n_pos = len(strat_df)
+            n_long = int((strat_df["qty"] > 0).sum()) if not strat_df.empty else 0
+            n_short = n_pos - n_long
+            ret_pct = (strat_pnl / invested * 100) if invested else 0.0
+            pnl_txt = ("+" if strat_pnl >= 0 else "−") + usd(abs(strat_pnl))
+            # Peso de cada posición como % del CAPITAL DE LA ESTRATEGIA (no de la cuenta
+            # total), para que sea comparable con el peso objetivo en el drift.
+            if not strat_df.empty and invested:
+                strat_df["weight"] = strat_df["market_value"] / invested
+
+            # Volatilidad anualizada estimada del portafolio actual (pesos × cov histórica).
+            vol_ann = float("nan")
+            if not strat_df.empty:
+                vol_ann = portfolio_vol(strat_df.groupby("ticker")["weight"].sum(), returns)
+
+            st.caption(f"Actualizado: {live['ts']} · solo posiciones de la estrategia (TSMOM)")
+            strip = "".join([
+                kpi("Invertido", usd(invested), "valor de mercado de la estrategia"),
+                kpi("P&L de la estrategia", pnl_txt, "acumulado (real + no real.)", "",
+                    f"tone-{tone(strat_pnl)}"),
+                kpi("Retorno", f"{ret_pct:+.2f}%", "P&L / invertido", "accent",
+                    f"tone-{tone(strat_pnl)}"),
+                kpi("Vol anualizada", pct(vol_ann, 1), "estimada · cov histórica", "accent"),
+                kpi("Posiciones", f"{n_pos}", f"{n_long}L · {n_short}S"),
+            ])
+            st.markdown(f'<div class="kpi-strip" style="grid-template-columns:repeat(5,1fr)">'
+                        f'{strip}</div>', unsafe_allow_html=True)
+
+            # ----- Gráfico de rendimiento (historial PERSISTENTE de la estrategia) -----
+            # Cada refresh suma un punto a logs/nav_history.csv, que PERSISTE entre
+            # sesiones (no se borra con el kill). Así, si volvés días después, ves la
+            # evolución completa desde el inicio.
+            nav_path = os.path.join(ROOT, "logs", "nav_history.csv")
+            if os.path.exists(nav_path) and os.path.getsize(nav_path) > 1:
+                nav = pd.read_csv(nav_path)
+                nav["timestamp"] = pd.to_datetime(nav["timestamp"], errors="coerce")
+                nav = nav.dropna(subset=["timestamp"]).sort_values("timestamp")
+                st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                            'RENDIMIENTO — HISTORIAL DE LA ESTRATEGIA <span class="panel-sub">'
+                            'P&L acumulado (realizado + no realizado) · no se reinicia en los '
+                            'rebalanceos · persiste entre sesiones</span></div></div>',
+                            unsafe_allow_html=True)
+                if len(nav) >= 1:
+                    desde = nav["timestamp"].iloc[0]
+                    dias = (nav["timestamp"].iloc[-1] - desde).days
+                    st.caption(f"Historial desde {desde:%d-%b %H:%M} · "
+                               f"{dias} día{'s' if dias != 1 else ''} · {len(nav)} puntos")
+                    # Ejes recalculados en cada refresh: SIEMPRE muestran todo el
+                    # historial (nunca recortan) + un margen para que no quede pegado
+                    # a los bordes. Incluyo el 0 porque el área se rellena hasta cero.
+                    yv = nav["pnl"].astype(float)
+                    ylo, yhi = min(yv.min(), 0.0), max(yv.max(), 0.0)
+                    ypad = (yhi - ylo) * 0.15 or max(abs(yhi), abs(ylo), 1.0) * 0.15
+                    t0, t1 = nav["timestamp"].iloc[0], nav["timestamp"].iloc[-1]
+                    tpad = (t1 - t0) * 0.04 if t1 > t0 else pd.Timedelta(hours=1)
+                    # Con muchos puntos, solo línea (más limpio); con pocos, línea+marcadores.
+                    _mode = "lines+markers" if len(nav) <= 60 else "lines"
+                    fperf = go.Figure(go.Scatter(
+                        x=nav["timestamp"], y=nav["pnl"], mode=_mode,
+                        line=dict(color=PAL["accent"], width=2),
+                        marker=dict(color=PAL["accent"], size=4),
+                        fill="tozeroy", fillcolor=T.rgba(PAL["accent"], 0.08),
+                        hovertemplate="%{x|%d-%b %H:%M}<br>P&L $%{y:,.2f}<extra></extra>"))
+                    fperf.add_hline(y=0, line_dash="dash", line_color=PAL["border"])
+                    T.fig_layout(fperf, PAL, height=260)
+                    fperf.update_yaxes(range=[ylo - ypad, yhi + ypad],
+                                       tickprefix="$", tickformat=",.0f")
+                    fperf.update_xaxes(range=[t0 - tpad, t1 + tpad])
+                    st.plotly_chart(fperf, use_container_width=True, config={"displayModeBar": False})
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.caption("📈 El gráfico de rendimiento se va armando con cada refresh "
+                           "(activá Auto-refresh para verlo evolucionar).")
+
+            if not strat_df.empty:
+                pdf = strat_df.copy()
+                pdf["asset_class"] = pdf["ticker"].map(ETF_UNIVERSE)
+                st.caption("Posiciones de la estrategia (tiempo real)")
+                st.dataframe(
+                    pdf[["ticker", "asset_class", "qty", "market_price", "market_value", "weight", "unrealized_pnl"]]
+                    .sort_values("market_value", ascending=False),
+                    use_container_width=True, hide_index=True)
+            else:
+                st.info("La estrategia no tiene posiciones abiertas todavía.")
+
+            # Drift: solo tickers de la estrategia (groupby por si hay varios lotes).
+            # Normalizamos el target al mismo gross (% de la estrategia) para que sea
+            # comparable con el peso actual: así, recién ejecutada, el drift es ~0.
+            cur_w = (strat_df.groupby("ticker")["weight"].sum() if not strat_df.empty
+                     else pd.Series(dtype=float))
+            _tgt_gross = float(target_weights.abs().sum()) or 1.0
+            target_pct = target_weights / _tgt_gross
+            drift_rows = []
+            for tk in target_pct.index.union(cur_w.index):
+                tw = float(target_pct.get(tk, 0.0))
+                cw = float(cur_w.get(tk, 0.0))
+                drift_rows.append({"ticker": tk, "asset_class": ETF_UNIVERSE.get(tk, "—"),
+                                   "target_w": round(tw, 4), "current_w": round(cw, 4),
+                                   "drift": round(tw - cw, 4)})
+            drift_df = pd.DataFrame(drift_rows)
+            drift_df["abs"] = drift_df["drift"].abs()
+            drift_df = drift_df.sort_values("abs", ascending=False).drop(columns="abs")
+            # Drift total = mitad de la suma de |drift| = fracción del portafolio que
+            # habría que reasignar para volver al target (turnover de un rebalanceo).
+            # Se recalcula en CADA refresh (cambia con los precios en vivo).
+            drift_total = float(drift_df["drift"].abs().sum()) / 2
+            # Sparkline del historial de drift (se mueve cuando el drift cambia).
+            spark = ""
+            if os.path.exists(nav_path) and os.path.getsize(nav_path) > 1:
+                _navd = pd.read_csv(nav_path)
+                if "drift" in _navd.columns and _navd["drift"].notna().sum() >= 2:
+                    spark = sparkline((_navd["drift"].dropna() * 100).tail(50).tolist(),
+                                      PAL["accent"], width=200, height=34)
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:2px 0">'
+                f'<span style="font-size:1.3rem;font-weight:700;color:var(--accent);'
+                f'font-family:\'JetBrains Mono\',monospace">Drift total: {pct(drift_total, 1)}</span>'
+                f'<span class="panel-sub">actualizado {live["ts"]} · se recalcula en cada refresh</span>'
+                f'<span style="flex:1;min-width:120px">{spark}</span></div>',
+                unsafe_allow_html=True)
+            st.caption("Cuánto del portafolio habría que reasignar para volver al target · "
+                       "top 8 posiciones más desviadas:")
+            st.dataframe(drift_df.head(8), use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ----- KILL SWITCH / RESET (siempre disponible si la estrategia está enrolada) -----
         st.markdown('<div class="panel" style="border-color:var(--neg)">'
                     '<div class="panel-head"><div class="panel-title" style="color:var(--neg)">'
                     '⛔ DETENER Y CERRAR TODO <span class="panel-sub">'
-                    'cierra TODAS las posiciones a mercado y detiene la estrategia</span>'
-                    '</div></div>', unsafe_allow_html=True)
+                    'cierra TODAS las posiciones, detiene la estrategia y borra el historial '
+                    '(operaciones + rendimiento) para empezar de cero</span></div></div>',
+                    unsafe_allow_html=True)
         ck1, ck2 = st.columns([1.3, 1])
-        confirm_kill = ck1.checkbox("Confirmo: cerrar todo y detener la estrategia")
+        confirm_kill = ck1.checkbox("Confirmo: cerrar todo, detener y borrar el historial")
         if ck2.button("🔪 EJECUTAR CORTE", type="primary", disabled=not confirm_kill):
-            from src.broker.orders import close_all_positions
+            from src.broker.orders import close_all_positions, clear_trade_logs, clear_nav_history
             try:
                 with ibkr_session(config, "kill") as conn:
                     closed = close_all_positions(conn, dry_run=False,
                                                  reason="kill switch (dashboard)")
                 _state.stop("kill switch (dashboard)")
-                st.session_state.pop("dry_run_orders", None)
-                st.error(f"⛔ Estrategia DETENIDA. Se enviaron {len(closed)} órdenes de cierre.")
+                # "Cerrar todas las operaciones" = empezar de cero: borra operaciones
+                # Y el historial de P&L, y reinicia el tracking acumulado.
+                clear_trade_logs()
+                clear_nav_history()
+                _state.reset_pnl()
+                st.session_state.pop("dry_run_res", None)
+                st.session_state.pop("last_exec", None)
+                st.error(f"⛔ Estrategia DETENIDA · {len(closed)} órdenes de cierre enviadas · "
+                         f"historial (operaciones + P&L) borrado. Listo para empezar de cero.")
                 _fetch_live()
                 st.rerun()
             except Exception as e:
                 st.error(f"Error al cortar: {e}")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if auto_refresh:
-            _time.sleep(interval_secs)
-            st.rerun()
+    # Auto-refresh: re-corre la página cada N seg (monitoreo en vivo, cualquier estado).
+    if auto_refresh:
+        _time.sleep(interval_secs)
+        st.rerun()
 
 
 # ============================================================ PÁGINA 5 · TRADE LOG

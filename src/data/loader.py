@@ -66,7 +66,7 @@ def data_status(config: dict) -> dict:
 
     monthly = compute_monthly_returns(prices)
     start = config["backtest"].get("start_date")
-    end = config["backtest"].get("end_date")
+    end = config["backtest"].get("end_date") or last_complete_month_end()
     if start:
         monthly = monthly[monthly.index >= start]
     if end:
@@ -102,12 +102,22 @@ def data_status(config: dict) -> dict:
     }
 
 
+def last_complete_month_end() -> str:
+    """Último mes CERRADO (fin del mes anterior al actual). Excluye el mes en curso
+    para que nunca entre un retorno mensual parcial. Se calcula con la fecha de hoy,
+    así la ventana del backtest avanza sola a medida que cierran los meses."""
+    from datetime import date, timedelta
+    first_of_month = date.today().replace(day=1)
+    return (first_of_month - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 def load_returns(config: dict) -> pd.DataFrame:
     prices = load_etf_prices(config["data"]["path"])
     returns = compute_monthly_returns(prices)
 
     start = config["backtest"].get("start_date")
-    end = config["backtest"].get("end_date")
+    # end_date vacío/None => ventana abierta: usa hasta el último mes COMPLETO (auto-avanza).
+    end = config["backtest"].get("end_date") or last_complete_month_end()
     if start:
         returns = returns[returns.index >= start]
     if end:

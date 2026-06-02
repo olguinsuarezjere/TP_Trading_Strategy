@@ -34,6 +34,11 @@ _DEFAULT = {
     "params": {},               # {signal_mode, lookback, target_vol, weighting}
     "last_rebalance_at": None,  # "YYYY-MM-DD" del último rebalanceo ejecutado
     "last_rebalance_id": None,  # id del último rebalanceo (para cruzar con los logs)
+    # Capital neto desplegado (compras − ventas, a precio de fill) acumulado en la
+    # vida de la estrategia. Sirve para el P&L acumulado real:
+    #   P&L acumulado = valor de mercado de las posiciones − net_deployed
+    #                 = (P&L realizado + no realizado), continuo entre rebalanceos.
+    "net_deployed": 0.0,
     # --- campos legacy (compatibilidad con código existente) ---
     "halted": False,            # True cuando status == "paused"
     "halted_at": None,
@@ -150,6 +155,32 @@ def stop(reason: str = "detenida (kill switch)") -> dict:
 
 # alias legacy: el código viejo llamaba halt() para el kill/pausa.
 halt = pause
+
+
+# ------------------------------------------------- P&L acumulado (net_deployed)
+
+def add_cash_flow(amount: float) -> dict:
+    """Suma un flujo de caja neto (compras − ventas, a precio de fill) al acumulado.
+    Positivo = se desplegó capital (compras netas); negativo = se retiró (ventas netas)."""
+    st = _read()
+    st["net_deployed"] = float(st.get("net_deployed", 0.0)) + float(amount)
+    return _write(st)
+
+
+def set_net_deployed(amount: float) -> dict:
+    """Fija el capital neto desplegado (p.ej. inicializar desde el costo base de
+    posiciones pre-existentes la primera vez que se trackea)."""
+    st = _read()
+    st["net_deployed"] = float(amount)
+    return _write(st)
+
+
+def reset_pnl() -> dict:
+    """Reinicia el tracking de P&L acumulado (net_deployed = 0). Lo usa el botón
+    explícito de 'reiniciar historial'; el kill switch NO lo toca."""
+    st = _read()
+    st["net_deployed"] = 0.0
+    return _write(st)
 
 
 def record_rebalance(rebalance_id: str, when: date | datetime | str | None = None) -> dict:

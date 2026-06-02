@@ -25,11 +25,13 @@ from . import state
 _LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
 TRADES_LOG = os.path.join(_LOG_DIR, "trades.csv")
 REBALANCES_LOG = os.path.join(_LOG_DIR, "rebalances.csv")
+NAV_LOG = os.path.join(_LOG_DIR, "nav_history.csv")
 
 TRADE_HEADER = ["timestamp", "rebalance_id", "ticker", "action", "qty",
                 "order_type", "limit_price", "fill_price", "status", "reason"]
 REBAL_HEADER = ["timestamp", "rebalance_id", "trigger", "signal_mode", "lookback",
                 "target_vol", "capital", "n_orders", "gross_notional", "status"]
+NAV_HEADER = ["timestamp", "invested", "pnl", "ret_pct", "drift"]
 
 
 def _yf_price(ticker: str) -> float:
@@ -69,6 +71,53 @@ def _init_log(path: str, header: list[str]) -> None:
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         with open(path, "w", newline="") as f:
             csv.writer(f).writerow(header)
+
+
+def clear_trade_logs() -> None:
+    """Borra los logs de OPERACIONES (trades y rebalances) para arrancar de cero al
+    'Detener y cerrar todo'. NO toca el historial de rendimiento (nav_history): ese
+    es el track record de la estrategia y persiste entre sesiones."""
+    for path in (TRADES_LOG, REBALANCES_LOG):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def clear_nav_history() -> None:
+    """Borra el historial de rendimiento (track record). Acción aparte y explícita:
+    el kill switch NO lo borra; esto es para cuando el usuario quiere reiniciar el
+    gráfico de cero a propósito."""
+    if os.path.exists(NAV_LOG):
+        os.remove(NAV_LOG)
+
+
+def log_nav_snapshot(invested: float, pnl: float, drift: float = 0.0) -> None:
+    """Registra una foto del rendimiento de la estrategia (para el gráfico en vivo).
+    Se llama en cada refresh del monitoreo. Solo registra si hay capital invertido.
+    `drift` = drift total (fracción a reasignar) en ese momento, para graficarlo.
+
+    Robusto a cambios de esquema: lee lo existente, garantiza las columnas de
+    NAV_HEADER (rellena las que falten en filas viejas) y reescribe. Así, agregar una
+    columna nueva NO desalinea ni corrompe el historial previo."""
+    if not invested or invested <= 0:
+        return
+    os.makedirs(os.path.dirname(NAV_LOG), exist_ok=True)
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "invested": round(invested, 2), "pnl": round(pnl, 2),
+        "ret_pct": round(pnl / invested * 100, 4), "drift": round(drift, 4),
+    }
+    if os.path.exists(NAV_LOG) and os.path.getsize(NAV_LOG) > 0:
+        try:
+            df = pd.read_csv(NAV_LOG)
+        except Exception:
+            df = pd.DataFrame(columns=NAV_HEADER)
+        for col in NAV_HEADER:                     # migrar esquema viejo si falta alguna
+            if col not in df.columns:
+                df[col] = 0.0
+        df = pd.concat([df[NAV_HEADER], pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row], columns=NAV_HEADER)
+    df.to_csv(NAV_LOG, index=False)
 
 
 def _log_trade(rebalance_id: str, ticker: str, action: str, qty: float, order_type: str,
@@ -164,6 +213,85 @@ def place_limit_order(
             "qty": abs(qty), "status": status}
 
 
+def _place_orders_batch(
+    conn: IBKRConnection,
+    orders: list[dict],
+    rebalance_id: str,
+    reason: str = "rebalance",
+    fill_timeout: float = 45.0,
+    on_progress=None,
+) -> tuple[list, int, int]:
+    """Dispara TODAS las órdenes de mercado de una y espera los fills UNA sola vez.
+
+    placeOrder() no bloquea, así que mandamos todo en ráfaga y recién después
+    esperamos que llenen. Pasa de ~minutos (orden por orden) a ~segundos.
+
+    on_progress(msg): callback opcional para reportar progreso a la UI.
+    Devuelve (placed, n_filled, n_pending)."""
+    def _p(msg):
+        if on_progress:
+            on_progress(msg)
+    # Resolver el contrato de cada orden: si viene el contrato EXACTO (cierre de
+    # warrants/opciones) lo usamos ruteando por SMART; si no, construimos Stock.
+    resolved = []  # (contract, order_dict)
+    to_qualify = []
+    for o in orders:
+        c = o.get("contract")
+        if c is not None:
+            c.exchange = "SMART"
+        else:
+            c = Stock(o["ticker"], "SMART", "USD")
+            to_qualify.append(c)
+        resolved.append((c, o))
+    if to_qualify:
+        conn.ib.qualifyContracts(*to_qualify)
+
+    # Disparar todas (sin esperar fill entre una y otra). Pausa breve cada 40 para
+    # no pasar el rate limit de IBKR (~50 mensajes/seg) y evitar pacing violations.
+    _p(f"Enviando {len(orders)} órdenes a IBKR…")
+    placed = []
+    for i, (c, o) in enumerate(resolved):
+        order = MarketOrder(o["action"], abs(o["qty"]))
+        order.tif = "DAY"  # evita el error 10349 del preset de TWS
+        trade = conn.ib.placeOrder(c, order)
+        placed.append((trade, o))
+        if (i + 1) % 40 == 0:
+            conn.ib.sleep(1)
+
+    # Esperar a que todas terminen (llenen/cancelen), una sola espera acotada.
+    _p(f"{len(placed)} órdenes enviadas. Esperando ejecución…")
+    done = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
+    waited = 0.0
+    last_nf = -1
+    while waited < fill_timeout and not all(t.orderStatus.status in done for t, _ in placed):
+        conn.ib.sleep(0.5)
+        waited += 0.5
+        nf = sum(t.orderStatus.status == "Filled" for t, _ in placed)
+        if nf != last_nf:           # reportar avance solo cuando cambia
+            _p(f"Ejecutando… {nf}/{len(placed)} órdenes llenadas")
+            last_nf = nf
+
+    # Registrar cada orden con su estado/fill final y acumular el flujo de caja neto
+    # (compras − ventas, a precio de fill) para el P&L acumulado real.
+    n_filled = 0
+    net_cash_flow = 0.0
+    for trade, o in placed:
+        status = trade.orderStatus.status
+        fill_price = trade.orderStatus.avgFillPrice or ""
+        n_filled += int(status == "Filled")
+        filled_qty = trade.orderStatus.filled or 0
+        if fill_price and filled_qty:
+            sign = 1.0 if o["action"] == "BUY" else -1.0   # compra = sale caja
+            net_cash_flow += sign * float(filled_qty) * float(fill_price)
+        _log_trade(rebalance_id, o["ticker"], o["action"], o["qty"], "MKT", None,
+                   fill_price, status, reason)
+    if net_cash_flow:
+        state.add_cash_flow(net_cash_flow)
+    n_pending = len(placed) - n_filled
+    print(f"  Fills: {n_filled}/{len(placed)} llenadas en {waited:.0f}s")
+    return placed, n_filled, n_pending
+
+
 def execute_rebalance(
     conn: IBKRConnection,
     target_weights: pd.Series,
@@ -171,7 +299,8 @@ def execute_rebalance(
     dry_run: bool = False,
     trigger: str = "manual",
     params: dict | None = None,
-) -> list[dict]:
+    on_progress=None,
+) -> dict:
     """
     Computa las órdenes necesarias para alcanzar target_weights y las ejecuta.
 
@@ -179,13 +308,23 @@ def execute_rebalance(
     capital: valor total del portafolio en USD
     dry_run: si True, solo computa las órdenes sin ejecutarlas ni registrarlas
     trigger: origen del rebalanceo (ej. "manual", "dashboard") — para el log
+    on_progress(msg): callback opcional para reportar el avance a la UI.
+
+    Devuelve un dict: {orders, skipped, n_filled, n_pending, gross_notional, rebalance_id}.
+    'skipped' = posiciones objetivo que daban < 1 acción (no se pueden operar enteras).
     """
+    def _p(msg):
+        if on_progress:
+            on_progress(msg)
+
     if not dry_run and state.is_halted():
         raise RuntimeError(
             "Estrategia CORTADA (halted). Reanudá la estrategia antes de operar.")
 
     rebalance_id = _new_rebalance_id("RB")
-    positions_df = conn.get_positions() if (not dry_run and conn is not None) else pd.DataFrame(
+    _p("Leyendo posiciones actuales…")
+    # get_portfolio_fast (una sola llamada) en vez de precio ticker-por-ticker.
+    positions_df = conn.get_portfolio_fast() if (not dry_run and conn is not None) else pd.DataFrame(
         columns=["ticker", "qty", "market_price", "market_value"]
     )
 
@@ -204,9 +343,11 @@ def execute_rebalance(
                    if t not in prices})
 
     orders = []
+    skipped = []   # posiciones objetivo que dan < 1 acción (no operables enteras)
     print(f"\n{'-'*55}")
     print(f"  Rebalanceo {rebalance_id} {'(DRY RUN) ' if dry_run else ''}— Capital: ${capital:,.0f}")
     print(f"{'-'*55}")
+    _p("Calculando órdenes objetivo…")
 
     for ticker, w_target in target_weights.items():
         target_value = w_target * capital
@@ -234,6 +375,9 @@ def execute_rebalance(
 
         qty = delta_value / price
         if abs(qty) < 1:
+            # Daría menos de 1 acción: no se puede operar entera, se omite.
+            skipped.append({"ticker": ticker, "target_w": round(float(w_target), 4),
+                            "qty_estimada": round(abs(qty), 3), "precio": round(price, 2)})
             continue
 
         action: Literal["BUY", "SELL"] = "BUY" if qty > 0 else "SELL"
@@ -244,20 +388,31 @@ def execute_rebalance(
         if dry_run:
             print(f"  {action:4} {round(abs(qty)):6} {ticker:6}  @ ~{price:.2f}  "
                   f"(D${delta_value:+,.0f})")
-        else:
-            place_market_order(conn, ticker, round(abs(qty)), action,
-                               rebalance_id=rebalance_id, reason="rebalance")
+
+    if skipped:
+        _p(f"{len(orders)} órdenes a ejecutar · {len(skipped)} omitidas (daban < 1 acción).")
+
+    # Ejecución EN LOTE: dispara todas las órdenes de una y espera los fills una
+    # sola vez (en vez de orden-por-orden, que tardaba minutos).
+    n_filled = n_pending = 0
+    if not dry_run and orders:
+        _, n_filled, n_pending = _place_orders_batch(
+            conn, orders, rebalance_id, reason="rebalance", on_progress=on_progress)
 
     gross_notional = sum(abs(o["qty"] * o["price"]) for o in orders)
     print(f"{'-'*55}")
     print(f"  Total órdenes: {len(orders)}  ·  Nocional bruto: ${gross_notional:,.0f}")
 
-    if not dry_run:
+    if not dry_run and orders:
         _log_rebalance(rebalance_id, trigger, len(orders), gross_notional, capital,
                        status="executed", params=params)
         # Marca el estado: el guard mensual y el catch-up al reconectar leen esto.
         state.record_rebalance(rebalance_id)
-    return orders
+        _p(f"✓ Listo: {n_filled}/{len(orders)} órdenes llenadas"
+           + (f" · {n_pending} sin confirmar" if n_pending else " · nada pendiente"))
+    return {"orders": orders, "skipped": skipped, "n_filled": n_filled,
+            "n_pending": n_pending, "gross_notional": gross_notional,
+            "rebalance_id": rebalance_id}
 
 
 def close_all_positions(
@@ -304,10 +459,8 @@ def close_all_positions(
         # "no cancelable" cuando todas las órdenes ya se completaron).
         if not conn.get_open_orders().empty:
             conn.cancel_all_orders()
-        for o in closeable:
-            place_market_order(conn, o["ticker"], o["qty"], o["action"],
-                               rebalance_id=rebalance_id, reason=reason,
-                               contract=o["contract"])
+        if closeable:
+            _place_orders_batch(conn, closeable, rebalance_id, reason=reason)
         _log_rebalance(rebalance_id, trigger="KILL", n_orders=len(closeable),
                        gross_notional=0.0, capital=0.0, status="executed")
     else:
