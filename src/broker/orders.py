@@ -349,24 +349,19 @@ def execute_rebalance(
 
     rebalance_id = _new_rebalance_id("RB")
     _p("Leyendo posiciones actuales…")
-    # get_portfolio_fast (una sola llamada) en vez de precio ticker-por-ticker.
-    positions_df = conn.get_portfolio_fast() if (not dry_run and conn is not None) else pd.DataFrame(
-        columns=["ticker", "qty", "market_price", "market_value"]
-    )
+    # Cantidades actuales de forma CONFIABLE (reqPositions + espera), agregadas por
+    # símbolo. CLAVE para netear bien: NO usamos el market_value del stream de cuenta,
+    # que en una conexión recién abierta puede no estar listo y haría que el rebalanceo
+    # crea la cuenta VACÍA y recompre todo el target → apilando posiciones (bug que
+    # infló la exposición a ~10×). reqPositions siempre devuelve las cantidades reales.
+    current_qty: dict[str, float] = {}
+    if not dry_run and conn is not None:
+        for p in conn.get_raw_positions():
+            current_qty[p["symbol"]] = current_qty.get(p["symbol"], 0.0) + p["qty"]
 
-    current_values: dict[str, float] = {}
-    prices: dict[str, float] = {}
-    if not positions_df.empty:
-        for _, row in positions_df.iterrows():
-            current_values[row["ticker"]] = row["market_value"]
-            prices[row["ticker"]] = row["market_price"]
-
-    # Precargar precios para DIMENSIONAR las órdenes (el fill real es a mercado igual).
-    # Fuente: el parquet LOCAL (instantáneo, sin red). Evita yfinance, que es lento y
-    # con la fecha futura del entorno falla ('start date after end date'). yfinance
-    # queda solo como último recurso por ticker, para alguno que no esté en el parquet.
-    need = [t for t in target_weights.index if t not in prices]
-    prices.update({t: p for t, p in _parquet_last_prices(need).items() if t not in prices})
+    # Precios del parquet LOCAL para valuar y dimensionar (instantáneo, sin red).
+    # Evita yfinance (lento y con la fecha futura del entorno falla).
+    prices: dict[str, float] = dict(_parquet_last_prices(list(target_weights.index)))
 
     orders = []
     skipped = []   # posiciones objetivo que dan < 1 acción (no operables enteras)
@@ -377,28 +372,24 @@ def execute_rebalance(
 
     for ticker, w_target in target_weights.items():
         target_value = w_target * capital
-        current_value = current_values.get(ticker, 0.0)
-        delta_value = target_value - current_value
 
         price = prices.get(ticker)
-        # Precio inválido (faltante / 0 / NaN): IBKR puede no devolver precio si la
-        # cuenta no tiene suscripción de datos (error 10089). Caemos a yfinance para
-        # dimensionar la orden en vez de crashear (el fill real es a mercado igual).
+        # Precio inválido (faltante / 0 / NaN): caemos a yfinance como último recurso
+        # (el fill real es a mercado igual).
         if price is None or price != price or price <= 0:
             try:
-                price = conn.get_market_price(ticker) if not dry_run else _yf_price(ticker)
+                price = _yf_price(ticker)
             except Exception:
                 price = 0.0
-            if price is None or price != price or price <= 0:
-                try:
-                    price = _yf_price(ticker)
-                except Exception:
-                    price = 0.0
             prices[ticker] = price
 
         if not price or price != price or price <= 0:
             continue
 
+        # Valuar la posición actual con el MISMO precio del parquet (consistente con el
+        # target) → delta = lo que falta comprar/vender para llegar al objetivo.
+        current_value = current_qty.get(ticker, 0.0) * price
+        delta_value = target_value - current_value
         qty = delta_value / price
         if abs(qty) < 1:
             # Daría menos de 1 acción: no se puede operar entera, se omite.

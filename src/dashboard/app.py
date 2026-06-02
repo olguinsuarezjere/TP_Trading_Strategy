@@ -660,24 +660,31 @@ elif page.startswith("04"):
     reb_params = {"signal_mode": signal_type, "lookback": lookback, "target_vol": target_vol}
 
     def _deploy_capital(net_liq: float) -> float:
-        """Capital que el usuario decidió destinar, acotado al NetLiquidation real.
+        """Capital que maneja la estrategia: SOLO su propia plata, no el portafolio.
 
-        Precaución: la estrategia NUNCA despliega más que lo que el usuario eligió
-        en «Capital a destinar», y nunca más que el NetLiquidation de la cuenta."""
+        Base = «Capital a destinar» (lo que el usuario asignó) + las ganancias/pérdidas
+        acumuladas de la estrategia → así reinvierte SUS ganancias (compounding) pero
+        nunca usa más dinero que el asignado para ella. Cota dura: el NetLiquidation real
+        de la cuenta (jamás despliega más de lo que hay)."""
         chosen = st.session_state.get("capital_deploy")
         if not chosen or chosen <= 0:
             chosen = net_liq
-        return float(min(chosen, net_liq))
+        cum_pnl = float((st.session_state.get("live") or {}).get("cum_pnl", 0.0))
+        equity = float(chosen) + cum_pnl          # asignado + ganancias propias
+        return float(min(max(equity, 1_000.0), net_liq))
 
     def _fetch_live(execute_due=False):
         """Conecta, trae portafolio/cuenta/PnL e info de conexión. Si execute_due y
         la estrategia está ACTIVA con un rebalanceo pendiente, lo ejecuta (auto-trade)."""
         from src.broker.monitor import get_live_portfolio, compute_live_pnl
         from src.broker.orders import execute_rebalance
+        from src.broker.market_hours import us_market_status
         auto_msg = None
+        # Auto-trade solo en sesión regular: fuera de horario las órdenes no llenan bien.
+        market_open = us_market_status()["can_trade"]
         with ibkr_session(config, "monitor") as conn:
             info = conn.get_connection_info()
-            if execute_due and _state.is_running() and _state.rebalance_due():
+            if execute_due and market_open and _state.is_running() and _state.rebalance_due():
                 capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
                 res = execute_rebalance(conn, target_weights, capital=capital,
                                         dry_run=False, trigger="auto", params=reb_params)
@@ -901,10 +908,11 @@ elif page.startswith("04"):
             exec_note = ("Empezó un mes nuevo: ejecutá para <b>ajustar las posiciones</b> al "
                          "target TSMOM actualizado de este mes.")
         else:                                     # ya operó este mes
-            exec_sub, exec_btn = f"al día · próxima {chk.next_rebalance_date}", "↻ Volver a ejecutar ahora"
+            exec_sub, exec_btn = f"al día · próxima {chk.next_rebalance_date}", "⟳ Rebalanceo instantáneo"
             exec_note = (f"✓ Ya se ejecutó este mes (última: <b>{last_rb}</b>). La próxima "
-                         f"ejecución programada es el <b>{chk.next_rebalance_date}</b>. Podés "
-                         f"volver a ejecutar manualmente para forzar el ajuste.")
+                         f"ejecución programada es el <b>{chk.next_rebalance_date}</b>. El "
+                         f"<b>rebalanceo instantáneo</b> re-alinea las posiciones al target ahora "
+                         f"(ajusta las diferencias; no agrega capital extra).")
 
         st.markdown(
             f'<div class="panel"><div class="panel-head"><div class="panel-title">'
@@ -919,6 +927,15 @@ elif page.startswith("04"):
                 None, target_weights, capital=cap, dry_run=True)
         if _state.is_paused():
             st.warning("⏸ Estrategia pausada: reanudala (arriba) para poder ejecutar.")
+        elif not mk["can_trade"]:
+            # Mercado cerrado / extendido: las market orders no llenan de forma
+            # confiable y el rebalanceo quedaría a medias (con la estrategia marcada
+            # como 'rebalanceada' aunque no se haya operado). Lo bloqueamos.
+            ec2.button(exec_btn, type="primary", disabled=True)
+            st.warning(f"🔒 Mercado cerrado ({mk['detail']}). El rebalanceo está "
+                       f"deshabilitado: fuera de la sesión regular las órdenes no llenan "
+                       f"bien y dejarían el portafolio inconsistente. Próxima sesión: "
+                       f"{mk['next_open_local']} (tu hora).")
         elif ec2.button(exec_btn, type="primary"):
             from src.broker.orders import execute_rebalance
             # Panel de progreso en vivo: cada mensaje del backend se escribe acá.
