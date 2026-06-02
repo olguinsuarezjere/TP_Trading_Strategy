@@ -188,8 +188,12 @@ class IBKRConnection:
         Usa `ib.portfolio()` (viene del stream de actualizaciones de cuenta de TWS),
         en vez de pedir `reqMktData` ticker por ticker con pausa. Para 100+ posiciones
         esto pasa de ~minutos a ~2 segundos. TWS calcula el marketPrice (datos
-        demorados si no hay suscripción en tiempo real)."""
-        self.ib.reqAccountUpdates()
+        demorados si no hay suscripción en tiempo real).
+
+        NO llamamos reqAccountUpdates(): ib_insync ya auto-suscribe las actualizaciones
+        de cuenta al conectar, así que ib.portfolio() ya está poblado. Llamar
+        reqAccountUpdates() con cuenta única y account='' se CUELGA esperando un
+        accountDownloadEnd que no llega."""
         self.ib.sleep(settle)
         rows = []
         for it in self.ib.portfolio():

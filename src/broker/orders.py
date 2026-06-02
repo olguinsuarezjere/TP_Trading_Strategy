@@ -126,6 +126,9 @@ def place_market_order(
     else:
         contract.exchange = "SMART"  # rutear smart aunque el contrato venga con primary exchange
     order = MarketOrder(action, abs(qty))
+    # TIF explícito DAY: sin esto, el preset de orden de TWS fuerza el TIF y dispara
+    # el error 10349 (cancela y reenvía la orden) → el status queda mal registrado.
+    order.tif = "DAY"
     trade = conn.ib.placeOrder(contract, order)
     conn.ib.sleep(1)
     _await_fill(conn, trade)
@@ -150,6 +153,7 @@ def place_limit_order(
     contract = Stock(ticker, "SMART", "USD")
     conn.ib.qualifyContracts(contract)
     order = LimitOrder(action, abs(qty), limit_price)
+    order.tif = "DAY"  # evita el error 10349 del preset de TWS (ver place_market_order)
     trade = conn.ib.placeOrder(contract, order)
     conn.ib.sleep(1)
     status = trade.orderStatus.status
@@ -296,7 +300,10 @@ def close_all_positions(
               f"la API de IBKR no permite cerrarla. Cerrala en TWS desktop.")
 
     if not dry_run and conn is not None:
-        conn.cancel_all_orders()  # cancelar pendientes primero
+        # Cancelar pendientes primero — solo si las hay (evita el ruido de error 161
+        # "no cancelable" cuando todas las órdenes ya se completaron).
+        if not conn.get_open_orders().empty:
+            conn.cancel_all_orders()
         for o in closeable:
             place_market_order(conn, o["ticker"], o["qty"], o["action"],
                                rebalance_id=rebalance_id, reason=reason,
