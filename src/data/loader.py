@@ -14,7 +14,13 @@ def load_etf_prices(path: str) -> pd.DataFrame:
 
 
 def update_prices(path: str, tickers: list[str] | None = None, start: str = "2012-01-01") -> pd.DataFrame:
+    import logging
     import yfinance as yf  # lazy import — solo se necesita al actualizar datos
+
+    # Silenciar el logger de yfinance: cuando un símbolo no devuelve datos imprime un
+    # 'possibly delisted ...' por ticker. Con el universo entero eso es ruido (los
+    # datos ya están en el parquet); lo callamos para no ensuciar la consola.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     if tickers is None:
         tickers = list(ETF_UNIVERSE.keys())
@@ -24,10 +30,21 @@ def update_prices(path: str, tickers: list[str] | None = None, start: str = "201
     if p.exists():
         existing = load_etf_prices(path)
         last_date = existing.index[-1]
-        start = (last_date + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
+        start_dt = last_date + pd.offsets.BDay(1)
+        # Si el parquet ya llega a hoy (no hay días nuevos para traer), NO llamar a
+        # yfinance: evita el error 'start date after end date' y la demora de N
+        # descargas fallidas. Solo se descarga cuando hay días hábiles nuevos.
+        if start_dt.normalize() > pd.Timestamp.today().normalize():
+            return existing
+        start = start_dt.strftime("%Y-%m-%d")
 
-    raw = yf.download(tickers, start=start, auto_adjust=True, progress=False)
-    new_prices = raw["Close"] if "Close" in raw.columns else raw
+    try:
+        raw = yf.download(tickers, start=start, auto_adjust=True, progress=False)
+        new_prices = raw["Close"] if "Close" in raw.columns else raw
+    except Exception:
+        return existing if not existing.empty else pd.DataFrame()
+    if new_prices is None or len(new_prices) == 0:
+        return existing if not existing.empty else pd.DataFrame()
 
     if not existing.empty:
         combined = pd.concat([existing, new_prices[~new_prices.index.isin(existing.index)]])

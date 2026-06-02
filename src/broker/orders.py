@@ -34,11 +34,37 @@ REBAL_HEADER = ["timestamp", "rebalance_id", "trigger", "signal_mode", "lookback
 NAV_HEADER = ["timestamp", "invested", "pnl", "ret_pct", "drift"]
 
 
+_DATA_PARQUET = os.path.join(os.path.dirname(_LOG_DIR), "Data", "etf_prices.parquet")
+
+
+def _parquet_last_prices(tickers: list[str]) -> dict[str, float]:
+    """Últimos precios de cierre del parquet LOCAL (rápido, sin red, confiable).
+
+    Fuente preferida para dimensionar órdenes: el parquet ya tiene los precios más
+    recientes de todos los ETFs. Evita yfinance, que es lento y —con la fecha futura
+    del entorno (2026)— falla con 'start date after end date'. El fill real es a
+    mercado igual, así que alcanza con el último precio conocido."""
+    try:
+        df = pd.read_parquet(_DATA_PARQUET).ffill()
+        last = df.iloc[-1]
+        return {t: float(last[t]) for t in tickers
+                if t in last.index and pd.notna(last[t]) and last[t] > 0}
+    except Exception:
+        return {}
+
+
 def _yf_price(ticker: str) -> float:
-    import yfinance as yf
-    info = yf.Ticker(ticker).fast_info
-    price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
-    return float(price) if price else 100.0
+    # Primero el parquet local (rápido/confiable); yfinance solo como último recurso.
+    p = _parquet_last_prices([ticker]).get(ticker)
+    if p:
+        return p
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).fast_info
+        price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+        return float(price) if price else 100.0
+    except Exception:
+        return 100.0
 
 
 def _yf_prices_batch(tickers: list[str]) -> dict[str, float]:
@@ -335,12 +361,12 @@ def execute_rebalance(
             current_values[row["ticker"]] = row["market_value"]
             prices[row["ticker"]] = row["market_price"]
 
-    # Precargar TODOS los precios en una sola descarga de yfinance (dry-run Y vivo).
-    # Sirve solo para DIMENSIONAR las órdenes (el fill real es a mercado). En vivo
-    # esto evita pedir a IBKR ticker por ticker —lento y, sin suscripción de datos,
-    # devuelve NaN—: pasa de ~minutos a ~segundos.
-    prices.update({t: p for t, p in _yf_prices_batch(list(target_weights.index)).items()
-                   if t not in prices})
+    # Precargar precios para DIMENSIONAR las órdenes (el fill real es a mercado igual).
+    # Fuente: el parquet LOCAL (instantáneo, sin red). Evita yfinance, que es lento y
+    # con la fecha futura del entorno falla ('start date after end date'). yfinance
+    # queda solo como último recurso por ticker, para alguno que no esté en el parquet.
+    need = [t for t in target_weights.index if t not in prices]
+    prices.update({t: p for t, p in _parquet_last_prices(need).items() if t not in prices})
 
     orders = []
     skipped = []   # posiciones objetivo que dan < 1 acción (no operables enteras)
