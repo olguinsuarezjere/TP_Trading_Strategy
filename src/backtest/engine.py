@@ -87,8 +87,13 @@ class BacktestEngine:
 
         net_returns = gross_returns - costs
 
-        # Drop leading NaN rows (warm-up period for signals)
-        first_valid = net_returns.first_valid_index()
+        # Drop the warm-up period: los primeros meses la señal todavía no tiene
+        # historia suficiente, así que los pesos quedan en 0 (no NaN) y el retorno
+        # da 0. Esos ceros no son performance real y, si se cuelan, diluyen las
+        # métricas (sobre todo hit rate y retorno anualizado). Arrancamos en el
+        # PRIMER MES ACTIVO (primera exposición real), no solo en el primer no-NaN.
+        active = weights.abs().sum(axis=1) > 0
+        first_valid = active.idxmax() if active.any() else net_returns.first_valid_index()
         net_returns   = net_returns.loc[first_valid:]
         gross_returns = gross_returns.loc[first_valid:]
         costs         = costs.loc[first_valid:]

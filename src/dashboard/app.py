@@ -22,8 +22,8 @@ from src.backtest.metrics import (
 from src.robustness.sensitivity import (
     lookback_sensitivity, target_vol_sensitivity, cost_sensitivity, optimize_sharpe,
 )
-from src.robustness.stress_test import analyze_crisis_performance, CRISIS_PERIODS
-from src.robustness.out_of_sample import walk_forward, expanding_window
+from src.robustness.stress_test import analyze_crisis_performance, crises_in_window, CRISIS_PERIODS
+from src.robustness.out_of_sample import walk_forward, out_of_sample_split
 from src.strategy.signals import compute_tsmom_signal, compute_signal_strength
 from src.strategy.volatility import compute_ex_ante_vol
 from src.dashboard import theme as T
@@ -94,6 +94,31 @@ def _optimal_params(base_config_str: str, data_token: str = ""):
     data_token (= último mes completo) invalida la cache cuando cierra un mes nuevo.
     Caché en memoria (sesión) + en disco (entre reinicios)."""
     return _opt_disk_cached(base_config_str, data_token)
+
+
+def _rob_config(signal_type: str, weighting: str, end_date: str) -> dict:
+    """Config base para los tests OOS: parte de config.yaml y solo fija señal,
+    ponderación y la ventana (end_date). NO depende de los sliders lookback/target_vol
+    porque el walk-forward y el OOS split RE-OPTIMIZAN esos parámetros por su cuenta."""
+    cfg = _load_config()
+    cfg = yaml.safe_load(yaml.dump(cfg))   # copia profunda
+    cfg["strategy"]["signal_mode"] = signal_type
+    cfg["strategy"]["weighting"] = weighting
+    cfg["backtest"]["end_date"] = end_date
+    return cfg
+
+
+@st.cache_data(show_spinner="Walk-forward OOS (re-optimizando por ventana)…")
+def _walk_forward_cached(signal_type: str, weighting: str, data_token: str):
+    cfg = _rob_config(signal_type, weighting, data_token)
+    return walk_forward(load_returns(cfg), cfg)
+
+
+@st.cache_data(show_spinner="Validación out-of-sample…")
+def _oos_split_cached(signal_type: str, weighting: str, data_token: str):
+    cfg = _rob_config(signal_type, weighting, data_token)
+    df = out_of_sample_split(load_returns(cfg), cfg)
+    return df, df.attrs.get("params"), df.attrs.get("split_date")
 
 
 @st.cache_data(show_spinner="Actualizando datos de mercado (yfinance)…")
@@ -540,7 +565,7 @@ elif page.startswith("02"):
     pivot.columns = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
     fh = go.Figure(go.Heatmap(
         z=pivot.values * 100, x=list(pivot.columns), y=[str(y) for y in pivot.index],
-        colorscale=[[0, PAL["neg"]], [0.5, PAL["bg-1"]], [1, PAL["accent"]]], zmid=0,
+        colorscale=[[0, PAL["neg"]], [0.5, PAL["bg-1"]], [1, PAL["pos"]]], zmid=0,
         text=np.round(pivot.values * 100, 1), texttemplate="%{text}",
         textfont=dict(size=9, family="JetBrains Mono"), showscale=False,
         hovertemplate="%{y} %{x}: %{z:.1f}%<extra></extra>"))
@@ -564,12 +589,19 @@ elif page.startswith("03"):
     with tab1:
         c1, c2 = st.columns(2)
         with c1:
-            lb_df = lookback_sensitivity(returns, config)
+            # Grilla que SIEMPRE incluye el lookback en uso (= óptimo por defecto), así el
+            # gráfico muestra la barra del parámetro operado y no uno cercano. Esa barra va
+            # resaltada (warn) para distinguir el punto de operación del resto.
+            lb_grid = sorted(set([3, 6, 9, 12, 15, 18, 21, 24, lookback]))
+            lb_df = lookback_sensitivity(returns, config, lookbacks=lb_grid)
+            lb_colors = [PAL["warn"] if i == lookback else (PAL["accent"] if v >= 0 else PAL["neg"])
+                         for i, v in zip(lb_df.index, lb_df["sharpe"])]
             flb = go.Figure(go.Bar(x=[str(i) for i in lb_df.index], y=lb_df["sharpe"],
-                                   marker_color=[PAL["accent"] if v >= 0 else PAL["neg"] for v in lb_df["sharpe"]]))
+                                   marker_color=lb_colors))
             T.fig_layout(flb, PAL, height=250)
             st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">SHARPE POR LOOKBACK '
-                        '<span class="panel-sub">meses</span></div></div>', unsafe_allow_html=True)
+                        f'<span class="panel-sub">meses · ▮ en uso: {lookback}m</span></div></div>',
+                        unsafe_allow_html=True)
             st.plotly_chart(flb, use_container_width=True, config={"displayModeBar": False})
             st.markdown('</div>', unsafe_allow_html=True)
         with c2:
@@ -592,17 +624,25 @@ elif page.startswith("03"):
 
     with tab2:
         cum = equity
+        # Solo las crisis que SOLAPAN con la ventana activa del backtest: así el sombreado
+        # del gráfico y la tabla muestran exactamente las mismas (sin pintar sobre vacío las
+        # que quedan antes del primer mes operado, p.ej. GFC 2008 o Taper 2013).
+        active_crises = crises_in_window(r.index)
         fc = go.Figure()
         fc.add_trace(go.Scatter(x=cum.index, y=cum.values, name="Portfolio",
                                 line=dict(color=PAL["accent"], width=2)))
-        for name, (s, e) in CRISIS_PERIODS.items():
-            fc.add_vrect(x0=s, x1=e, fillcolor=PAL["neg"], opacity=0.10, line_width=0,
+        for name, (s, e) in active_crises.items():
+            fc.add_vrect(x0=max(pd.Timestamp(s), cum.index[0]), x1=min(pd.Timestamp(e), cum.index[-1]),
+                         fillcolor=PAL["neg"], opacity=0.10, line_width=0,
                          annotation_text=name, annotation_position="top left",
                          annotation_font=dict(size=9, color=PAL["text-dim"]))
         fc.update_yaxes(type="log")
+        fc.update_xaxes(range=[cum.index[0], cum.index[-1]])
         T.fig_layout(fc, PAL, height=300)
+        skipped = [k for k in CRISIS_PERIODS if k not in active_crises]
+        sub = "escala log" + (f" · fuera de ventana: {', '.join(skipped)}" if skipped else "")
         st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'EQUITY CURVE — CRISIS SOMBREADAS <span class="panel-sub">escala log</span></div></div>',
+                    f'EQUITY CURVE — CRISIS SOMBREADAS <span class="panel-sub">{sub}</span></div></div>',
                     unsafe_allow_html=True)
         st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
         st.markdown('</div>', unsafe_allow_html=True)
@@ -613,22 +653,71 @@ elif page.startswith("03"):
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tab3:
-        wf_df = walk_forward(returns, config)
+        st.caption(
+            "Test **honesto**: en cada ventana se re-optimizan los parámetros (lookback, target vol) "
+            "usando **solo el pasado** y se mide el año siguiente, que el optimizador nunca vio. "
+            "Mide la estrategia tal como se operaría en vivo, sin mirar el futuro."
+        )
+
+        # --- Walk-forward anclado con RE-OPTIMIZACIÓN por ventana (cacheado: solo depende
+        #     de señal/ponderación/mes, no de los sliders, porque re-optimiza por su cuenta).
+        wf_df = _walk_forward_cached(signal_type, weighting, data_token)
         if not wf_df.empty:
             fw = go.Figure(go.Bar(x=wf_df["test_start"].astype(str), y=wf_df["sharpe"],
                                   marker_color=[PAL["accent"] if v >= 0 else PAL["neg"] for v in wf_df["sharpe"]]))
             fw.add_hline(y=0, line_dash="dash", line_color=PAL["border"])
             T.fig_layout(fw, PAL, height=260)
+            mean_sh = wf_df["sharpe"].mean()
+            pos = (wf_df["sharpe"] > 0).mean()
             st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                        'WALK-FORWARD — SHARPE OUT-OF-SAMPLE</div></div>', unsafe_allow_html=True)
+                        'WALK-FORWARD — SHARPE OUT-OF-SAMPLE '
+                        '<span class="panel-sub">anclado · re-optimizado por ventana · test 1 año</span>'
+                        '</div></div>', unsafe_allow_html=True)
             st.plotly_chart(fw, use_container_width=True, config={"displayModeBar": False})
             st.markdown('</div>', unsafe_allow_html=True)
-            st.dataframe(wf_df.round(2), use_container_width=True)
+            strip = "".join([
+                kpi("Sharpe OOS medio", f"{mean_sh:.2f}", "promedio ventanas", "accent", "tone-accent"),
+                kpi("Sharpe OOS mediana", f"{wf_df['sharpe'].median():.2f}", "robusto a outliers"),
+                kpi("Ventanas positivas", f"{pos*100:.0f}%", f"{int((wf_df['sharpe']>0).sum())}/{len(wf_df)} años"),
+                kpi("Ventanas", f"{len(wf_df)}", "train≥5a · test 1a"),
+            ])
+            st.markdown(f'<div class="kpi-strip">{strip}</div>', unsafe_allow_html=True)
 
+            wf_show = pd.DataFrame({
+                "train_end":  wf_df["train_end"],
+                "test":       wf_df["test_start"] + " → " + wf_df["test_end"],
+                "lookback":   wf_df["lookback"].astype(int).astype(str) + "m",
+                "target_vol": (wf_df["target_vol"] * 100).round(0).astype(int).astype(str) + "%",
+                "sharpe":     wf_df["sharpe"].round(2),
+                "ann_ret":    (wf_df["ann_ret"] * 100).round(1).astype(str) + "%",
+                "max_dd":     (wf_df["max_dd"] * 100).round(1).astype(str) + "%",
+            })
+            st.dataframe(wf_show, use_container_width=True, hide_index=True)
+            st.caption(
+                "Las columnas **lookback / target_vol** son el óptimo elegido con datos hasta `train_end`: "
+                "si saltan mucho de una ventana a otra, es la huella del riesgo de sobreajuste del parámetro "
+                "(y el Sharpe OOS de al lado es lo que se logró igual, sin conocer el futuro)."
+            )
+
+        # --- OOS limpio por corte único: optimiza en el primer tramo, aplica al resto. ---
+        oos_df, oos_params, oos_split = _oos_split_cached(signal_type, weighting, data_token)
         st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'IN-SAMPLE vs OUT-OF-SAMPLE</div></div>', unsafe_allow_html=True)
-        st.dataframe(expanding_window(returns, config).round(2), use_container_width=True)
+                    'IN-SAMPLE vs OUT-OF-SAMPLE '
+                    f'<span class="panel-sub">corte {oos_split} · optimizado solo con el in-sample</span>'
+                    '</div></div>', unsafe_allow_html=True)
+        oos_show = oos_df.copy()
+        oos_show["Sharpe"] = oos_show["Sharpe"].round(2)
+        oos_show["Ann Ret"] = (oos_show["Ann Ret"] * 100).round(1).astype(str) + "%"
+        oos_show["Max DD"] = (oos_show["Max DD"] * 100).round(1).astype(str) + "%"
+        st.dataframe(oos_show, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
+        if oos_params:
+            st.caption(
+                f"Parámetros fijados con el in-sample (hasta {oos_split}): "
+                f"**lookback {oos_params['lookback']}m · target vol {oos_params['target_vol']*100:.0f}%**, "
+                "y aplicados sin cambios al out-of-sample. Que el Sharpe OOS **no se derrumbe** frente al "
+                "in-sample es la evidencia de que la estrategia no vive del sobreajuste."
+            )
 
 
 # ============================================================ PÁGINA 4 · LIVE PORTFOLIO

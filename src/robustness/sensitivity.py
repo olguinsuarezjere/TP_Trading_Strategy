@@ -20,7 +20,7 @@ def _run_variant(returns: pd.DataFrame, config: dict) -> dict:
 def lookback_sensitivity(
     returns: pd.DataFrame,
     config: dict,
-    lookbacks: list[int] = [3, 6, 9, 12, 18, 24],
+    lookbacks: list[int] = [3, 6, 9, 12, 15, 18, 21, 24],
 ) -> pd.DataFrame:
     rows = []
     for lb in lookbacks:
