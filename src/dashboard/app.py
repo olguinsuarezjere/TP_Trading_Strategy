@@ -265,6 +265,20 @@ def panel(title, body, sub="", right=""):
             f'<div class="panel-body">{body}</div></div>')
 
 
+def df_html(df, index=True, index_label=""):
+    """DataFrame → tabla HTML estática themed. Se usa en vez de st.dataframe en los
+    paneles: el grid interactivo de Streamlit (canvas + ResizeObserver) vibra cuando
+    auto-ajusta su alto dentro de un contenedor; una <table> plana queda fija, sin
+    scroll y sin temblar."""
+    ths = (f'<th>{html.escape(index_label)}</th>' if index else "") + \
+          "".join(f'<th>{html.escape(str(c))}</th>' for c in df.columns)
+    body = ""
+    for idx, row in df.iterrows():
+        idx_td = f'<td class="dft-idx">{html.escape(str(idx))}</td>' if index else ""
+        body += "<tr>" + idx_td + "".join(f'<td>{html.escape(str(row[c]))}</td>' for c in df.columns) + "</tr>"
+    return f'<table class="dftable"><thead><tr>{ths}</tr></thead><tbody>{body}</tbody></table>'
+
+
 # ============================================================ APP SHELL
 
 st.set_page_config(page_title="TSMOM Terminal · F414 UdeSA", page_icon="📟",
@@ -616,11 +630,15 @@ elif page.startswith("03"):
             st.plotly_chart(fcs, use_container_width=True, config={"displayModeBar": False})
             st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'SENSIBILIDAD AL TARGET VOL</div></div>', unsafe_allow_html=True)
         tv_df = target_vol_sensitivity(returns, config)
-        st.dataframe(tv_df.round(3), use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        tv_fmt = pd.DataFrame({
+            "Sharpe":  tv_df["sharpe"].round(2),
+            "Ann Ret": (tv_df["ann_ret"] * 100).round(1).astype(str) + "%",
+            "Max DD":  (tv_df["max_dd"] * 100).round(1).astype(str) + "%",
+        })
+        tv_fmt.index = (tv_df.index * 100).round(0).astype(int).astype(str) + "%"
+        st.markdown(panel("SENSIBILIDAD AL TARGET VOL", df_html(tv_fmt, index_label="target vol")),
+                    unsafe_allow_html=True)
 
     with tab2:
         cum = equity
@@ -647,10 +665,9 @@ elif page.startswith("03"):
         st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
         st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'PERFORMANCE DURANTE CRISIS</div></div>', unsafe_allow_html=True)
-        st.dataframe(analyze_crisis_performance(r), use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        crisis_df = analyze_crisis_performance(r)
+        st.markdown(panel("PERFORMANCE DURANTE CRISIS", df_html(crisis_df, index_label="Period")),
+                    unsafe_allow_html=True)
 
     with tab3:
         st.caption(
@@ -692,7 +709,8 @@ elif page.startswith("03"):
                 "ann_ret":    (wf_df["ann_ret"] * 100).round(1).astype(str) + "%",
                 "max_dd":     (wf_df["max_dd"] * 100).round(1).astype(str) + "%",
             })
-            st.dataframe(wf_show, use_container_width=True, hide_index=True)
+            st.markdown(panel("DETALLE POR VENTANA", df_html(wf_show, index=False)),
+                        unsafe_allow_html=True)
             st.caption(
                 "Las columnas **lookback / target_vol** son el óptimo elegido con datos hasta `train_end`: "
                 "si saltan mucho de una ventana a otra, es la huella del riesgo de sobreajuste del parámetro "
@@ -701,16 +719,13 @@ elif page.startswith("03"):
 
         # --- OOS limpio por corte único: optimiza en el primer tramo, aplica al resto. ---
         oos_df, oos_params, oos_split = _oos_split_cached(signal_type, weighting, data_token)
-        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'IN-SAMPLE vs OUT-OF-SAMPLE '
-                    f'<span class="panel-sub">corte {oos_split} · optimizado solo con el in-sample</span>'
-                    '</div></div>', unsafe_allow_html=True)
         oos_show = oos_df.copy()
         oos_show["Sharpe"] = oos_show["Sharpe"].round(2)
         oos_show["Ann Ret"] = (oos_show["Ann Ret"] * 100).round(1).astype(str) + "%"
         oos_show["Max DD"] = (oos_show["Max DD"] * 100).round(1).astype(str) + "%"
-        st.dataframe(oos_show, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(panel("IN-SAMPLE vs OUT-OF-SAMPLE", df_html(oos_show, index_label="Period"),
+                          sub=f"corte {oos_split} · optimizado solo con el in-sample"),
+                    unsafe_allow_html=True)
         if oos_params:
             st.caption(
                 f"Parámetros fijados con el in-sample (hasta {oos_split}): "

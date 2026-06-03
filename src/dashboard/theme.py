@@ -192,6 +192,17 @@ section[data-testid="stSidebar"] label p { color:var(--text-dim); font-size:11px
 .sig-pop-metrics b { font-size:12.5px; font-weight:700; letter-spacing:0; color:var(--text);
                      font-family:'JetBrains Mono', ui-monospace, monospace; }
 
+/* ---- tablas estáticas (df_html) — sin scroll, no tiemblan ---- */
+.dftable { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:11.5px;
+           font-variant-numeric:tabular-nums; }
+.dftable th { text-align:right; color:var(--text-faint); font-weight:600; font-size:9.5px;
+              letter-spacing:.5px; text-transform:uppercase; padding:5px 9px; border-bottom:1px solid var(--border); white-space:nowrap; }
+.dftable td { text-align:right; color:var(--text); padding:5px 9px; border-bottom:1px solid var(--border-soft); white-space:nowrap; }
+.dftable th:first-child, .dftable td:first-child { text-align:left; }
+.dftable td.dft-idx { color:var(--text-dim); }
+.dftable tbody tr:last-child td { border-bottom:none; }
+.dftable tbody tr:hover td { background:color-mix(in srgb, var(--accent) 6%, transparent); }
+
 /* ---- NAV hero ---- */
 .nav-val { color:var(--text); font-size:2.6rem; font-weight:700; line-height:1; letter-spacing:-.02em; }
 .nav-delta { font-size:.92rem; font-weight:600; margin-top:3px; }
