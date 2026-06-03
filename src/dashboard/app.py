@@ -13,7 +13,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.data.loader import load_returns
-from src.data.universe import ETF_UNIVERSE, ASSET_CLASSES
+from src.data.universe import ETF_UNIVERSE, ASSET_CLASSES, ETF_INFO
 from src.backtest.engine import BacktestEngine
 from src.backtest.metrics import (
     sharpe_ratio, sortino_ratio, annualized_return, annualized_volatility,
@@ -408,9 +408,22 @@ if page.startswith("01"):
                 s = 0.0 if pd.isna(s) else float(s)
                 intn = min(1.0, abs(s) / 3.0)
                 side = "sig-pos" if d >= 0 else "sig-neg"
-                cells += (f'<div class="sigcell {side}" style="--int:{intn:.2f}">'
+                name, desc = ETF_INFO.get(tk, (tk, AC_LABEL.get(ETF_UNIVERSE.get(tk, ""), "—")))
+                dir_lbl = "LONG" if d >= 0 else "SHORT"
+                dir_cls = "tone-pos" if d >= 0 else "tone-neg"
+                cells += (f'<details class="sigcell {side}" style="--int:{intn:.2f}">'
+                          f'<summary>'
                           f'<span class="sig-tk">{tk}</span>'
-                          f'<span class="sig-bar"><span style="width:{intn*100:.0f}%"></span></span></div>')
+                          f'<span class="sig-bar"><span style="width:{intn*100:.0f}%"></span></span>'
+                          f'</summary>'
+                          f'<div class="sig-pop">'
+                          f'<div class="sig-pop-name">{html.escape(name)}</div>'
+                          f'<div class="sig-pop-desc">{html.escape(desc)}</div>'
+                          f'<div class="sig-pop-metrics">'
+                          f'<span>Dirección<b class="{dir_cls}">{dir_lbl}</b></span>'
+                          f'<span>Fuerza<b>{s:+.2f}</b></span>'
+                          f'<span>Intensidad<b>{intn*100:.0f}%</b></span>'
+                          f'</div></div></details>')
             nl = sum(1 for t in tickers if last_dir.get(t, 0) >= 0)
             sections += (f'<div class="sig-class"><div class="sig-class-head">'
                          f'<span class="sig-class-name">{AC_LABEL[ac]}</span>'
@@ -429,23 +442,34 @@ if page.startswith("01"):
                     f'<span>calmar <b>{num(calmar_ratio(r))}</b></span></div>')
         st.markdown(panel("NAV DESDE INICIO", nav_body, sub="base 1.00×"), unsafe_allow_html=True)
 
-        rows = ""
+        st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
+                    'EXPOSICIÓN POR CLASE <span class="panel-sub">long vs short</span></div></div>'
+                    '<div class="panel-body">', unsafe_allow_html=True)
         for ac in ASSET_CLASSES:
             tickers = [t for t in valid.index if ETF_UNIVERSE.get(t) == ac]
             if not tickers:
                 continue
             nl = sum(1 for t in tickers if last_dir.get(t, 0) >= 0)
             ns = len(tickers) - nl
-            lp = nl / len(tickers) * 100
-            sp = ns / len(tickers) * 100
-            rows += (f'<div class="ac-row"><span class="ac-name">{AC_LABEL[ac]}</span>'
-                     f'<span class="ac-track"><span class="ac-fill pos" style="width:{lp:.0f}%"></span>'
-                     f'<span class="ac-fill neg" style="width:{sp:.0f}%"></span></span>'
-                     f'<span class="ac-meta">{nl}/{ns}</span></div>')
-        rows += (f'<div class="ac-foot">Net exposure agregado '
-                 f'<b class="{tone(net_exp)}">{pct(net_exp,0,True)}</b> · gross 100% · '
-                 f'{n_long} long / {n_short} short</div>')
-        st.markdown(panel("EXPOSICIÓN POR CLASE", rows), unsafe_allow_html=True)
+            st.markdown(f'<div class="ac-pie-head"><span class="ac-pie-name">{AC_LABEL[ac]}</span>'
+                        f'<span class="ac-pie-meta">{nl}L · {ns}S</span></div>', unsafe_allow_html=True)
+            fpie = go.Figure(go.Pie(
+                labels=["Long", "Short"], values=[nl, ns], sort=False, direction="clockwise",
+                hole=0.62, marker=dict(colors=[PAL["pos"], PAL["neg"]],
+                                       line=dict(color=PAL["bg-1"], width=2)),
+                textinfo="value", textfont=dict(family=T.MONO, size=13, color=PAL["bg-1"]),
+                hovertemplate="%{label}: %{value} (%{percent})<extra></extra>"))
+            fpie.update_layout(
+                paper_bgcolor=PAL["bg-1"], plot_bgcolor=PAL["bg-1"], height=132,
+                margin=dict(l=8, r=8, t=4, b=4), showlegend=False,
+                annotations=[dict(text=f"{nl+ns}", x=0.5, y=0.5, showarrow=False,
+                                  font=dict(family=T.MONO, size=17, color=PAL["text"]))])
+            st.plotly_chart(fpie, use_container_width=True,
+                            config={"displayModeBar": False}, key=f"acpie_{ac}")
+        st.markdown(f'<div class="ac-foot">Net exposure agregado '
+                    f'<b class="{tone(net_exp)}">{pct(net_exp,0,True)}</b> · gross 100% · '
+                    f'{n_long} long / {n_short} short</div>'
+                    '</div></div>', unsafe_allow_html=True)
 
 
 # ============================================================ PÁGINA 2 · BACKTEST

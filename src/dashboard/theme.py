@@ -167,15 +167,30 @@ section[data-testid="stSidebar"] label p { color:var(--text-dim); font-size:11px
 .sig-class-meta { color:var(--text-dim); font-size:10px; }
 .sig-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(78px,1fr)); gap:4px; }
 .sig-pos { color:var(--pos); } .sig-neg { color:var(--neg); }
-.sigcell { border:1px solid var(--border); border-radius:2px; padding:5px 7px 6px;
+.sigcell { position:relative; border:1px solid var(--border); border-radius:2px; padding:5px 7px 6px;
            background:color-mix(in srgb, currentColor calc(var(--int) * 17%), var(--bg-2));
-           transition:transform .08s, border-color .12s; }
+           transition:transform .08s, border-color .12s; cursor:pointer; }
 .sigcell:hover { transform:translateY(-1px); border-color:currentColor; z-index:2; }
+.sigcell[open] { border-color:currentColor; z-index:30; }
+.sigcell > summary { list-style:none; display:block; outline:none; }
+.sigcell > summary::-webkit-details-marker { display:none; }
 .sig-tk { font-size:.74rem; font-weight:600; display:block; }
 .sigcell.sig-pos .sig-tk { color:color-mix(in srgb, var(--pos) 70%, var(--text)); }
 .sigcell.sig-neg .sig-tk { color:color-mix(in srgb, var(--neg) 70%, var(--text)); }
 .sig-bar { display:block; height:3px; background:var(--bg-0); margin-top:4px; border-radius:2px; overflow:hidden; }
 .sig-bar span { display:block; height:100%; background:currentColor; }
+/* panel desplegable al hacer click en un ETF */
+.sig-pop { position:absolute; top:calc(100% + 5px); left:0; z-index:40; cursor:default;
+           width:236px; max-width:74vw; padding:10px 12px;
+           background:var(--bg-1); border:1px solid var(--border); border-radius:4px;
+           box-shadow:0 8px 26px rgba(0,0,0,.5); color:var(--text); }
+.sig-pop-name { font-size:11.5px; font-weight:700; line-height:1.25; color:var(--text); }
+.sig-pop-desc { font-size:10.5px; line-height:1.45; color:var(--text-dim); margin-top:4px; }
+.sig-pop-metrics { display:flex; gap:14px; margin-top:9px; padding-top:8px; border-top:1px solid var(--border-soft); }
+.sig-pop-metrics > span { display:flex; flex-direction:column; gap:2px;
+                          font-size:9px; letter-spacing:.6px; text-transform:uppercase; color:var(--text-faint); }
+.sig-pop-metrics b { font-size:12.5px; font-weight:700; letter-spacing:0; color:var(--text);
+                     font-family:'JetBrains Mono', ui-monospace, monospace; }
 
 /* ---- NAV hero ---- */
 .nav-val { color:var(--text); font-size:2.6rem; font-weight:700; line-height:1; letter-spacing:-.02em; }
@@ -189,6 +204,10 @@ section[data-testid="stSidebar"] label p { color:var(--text-dim); font-size:11px
 .ac-track { display:flex; height:9px; background:var(--bg-2); overflow:hidden; }
 .ac-fill.pos { background:var(--pos); } .ac-fill.neg { background:var(--neg); }
 .ac-meta { color:var(--text-faint); font-size:10px; text-align:right; }
+.ac-pie-head { display:flex; justify-content:space-between; align-items:baseline;
+               margin:6px 0 -6px; padding-bottom:3px; border-bottom:1px solid var(--border-soft); }
+.ac-pie-name { color:var(--text); font-size:11px; letter-spacing:1.2px; text-transform:uppercase; }
+.ac-pie-meta { color:var(--text-dim); font-size:10px; font-family:var(--mono); font-variant-numeric:tabular-nums; letter-spacing:.04em; }
 .ac-foot { color:var(--text-dim); font-size:10.5px; margin-top:8px; line-height:1.5; }
 .ac-foot b { color:var(--text); } .ac-foot b.pos{color:var(--pos);} .ac-foot b.neg{color:var(--neg);}
 
