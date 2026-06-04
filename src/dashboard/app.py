@@ -14,6 +14,7 @@ if ROOT not in sys.path:
 
 from src.data.loader import load_returns
 from src.data.universe import ETF_UNIVERSE, ASSET_CLASSES, ETF_INFO
+from src.data.riskfree import load_tbill_1m_monthly
 from src.backtest.engine import BacktestEngine
 from src.backtest.metrics import (
     sharpe_ratio, sortino_ratio, annualized_return, annualized_volatility,
@@ -22,8 +23,8 @@ from src.backtest.metrics import (
 from src.robustness.sensitivity import (
     lookback_sensitivity, target_vol_sensitivity, cost_sensitivity, optimize_sharpe,
 )
-from src.robustness.stress_test import analyze_crisis_performance, crises_in_window, CRISIS_PERIODS
-from src.robustness.out_of_sample import walk_forward, out_of_sample_split
+from src.robustness.stress_test import analyze_crisis_performance, crises_in_window
+from src.robustness.out_of_sample import walk_forward
 from src.strategy.signals import compute_tsmom_signal, compute_signal_strength
 from src.strategy.volatility import compute_ex_ante_vol
 from src.dashboard import theme as T
@@ -112,13 +113,6 @@ def _rob_config(signal_type: str, weighting: str, end_date: str) -> dict:
 def _walk_forward_cached(signal_type: str, weighting: str, data_token: str):
     cfg = _rob_config(signal_type, weighting, data_token)
     return walk_forward(load_returns(cfg), cfg)
-
-
-@st.cache_data(show_spinner="Validación out-of-sample…")
-def _oos_split_cached(signal_type: str, weighting: str, data_token: str):
-    cfg = _rob_config(signal_type, weighting, data_token)
-    df = out_of_sample_split(load_returns(cfg), cfg)
-    return df, df.attrs.get("params"), df.attrs.get("split_date")
 
 
 @st.cache_data(show_spinner="Actualizando datos de mercado (yfinance)…")
@@ -296,6 +290,11 @@ opt_overlay = st.empty()
 
 with st.sidebar:
     st.markdown(
+        '<div class="side-team">'
+        '<span class="side-team-label">Grupo</span>'
+        '<span>Ricardo Falú · Bautista Remondino · Jeremías Olguín · Read Aveiro</span>'
+        '</div>', unsafe_allow_html=True)
+    st.markdown(
         '<div class="side-head"><div class="side-logo">◢</div>'
         '<div><div class="side-title">TSMOM</div><div class="side-sub">SYSTEM v2.1</div></div></div>',
         unsafe_allow_html=True)
@@ -450,7 +449,7 @@ if page.startswith("01"):
                 name, desc = ETF_INFO.get(tk, (tk, AC_LABEL.get(ETF_UNIVERSE.get(tk, ""), "—")))
                 dir_lbl = "LONG" if d >= 0 else "SHORT"
                 dir_cls = "tone-pos" if d >= 0 else "tone-neg"
-                cells += (f'<details class="sigcell {side}" style="--int:{intn:.2f}">'
+                cells += (f'<details class="sigcell {side}" name="etfsig" style="--int:{intn:.2f}">'
                           f'<summary>'
                           f'<span class="sig-tk">{tk}</span>'
                           f'<span class="sig-bar"><span style="width:{intn*100:.0f}%"></span></span>'
@@ -480,6 +479,27 @@ if page.startswith("01"):
                     f'<span>maxDD <b class="tone-neg">{pct(max_drawdown(r),1)}</b></span>'
                     f'<span>calmar <b>{num(calmar_ratio(r))}</b></span></div>')
         st.markdown(panel("NAV DESDE INICIO", nav_body, sub="base 1.00×"), unsafe_allow_html=True)
+
+        # Tasa libre de riesgo (T-bill 1m) usada en el Sharpe excess. Chart Plotly CON
+        # hover (fecha + tasa). Se renderiza como título + chart + footer AUTOCONTENIDOS
+        # (cada st.markdown con sus <div> balanceados), sin envolver el iframe en un
+        # <div class="panel"> abierto en un markdown y cerrado en otro — ese patrón dejaba
+        # un </div> huérfano que descolocaba el panel de Exposición en esta columna angosta.
+        rf_ann = load_tbill_1m_monthly(r.index) * 12 * 100          # mensual decimal -> % anual
+        frf = go.Figure(go.Scatter(
+            x=rf_ann.index, y=rf_ann.values, mode="lines",
+            line=dict(color=PAL["info"], width=1.8),
+            fill="tozeroy", fillcolor=T.rgba(PAL["info"], 0.10),
+            hovertemplate="%{x|%b %Y}<br>rf <b>%{y:.2f}%</b><extra></extra>"))
+        frf.update_yaxes(ticksuffix="%")
+        T.fig_layout(frf, PAL, height=170)
+        frf.update_layout(hovermode="x unified")   # tooltip salta en cualquier punto del ancho
+        st.markdown('<div class="panel-title" style="padding:6px 2px 2px">TASA LIBRE DE RIESGO '
+                    '<span class="panel-sub">T-bill 1m · % anual</span></div>', unsafe_allow_html=True)
+        st.plotly_chart(frf, use_container_width=True, config={"displayModeBar": False}, key="rf_curve")
+        st.markdown(f'<div class="ac-foot" style="margin-top:-10px">actual '
+                    f'<b class="tone-accent">{rf_ann.iloc[-1]:.2f}%</b> · prom {rf_ann.mean():.2f}% · '
+                    f'usada en el Sharpe excess</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
                     'EXPOSICIÓN POR CLASE <span class="panel-sub">long vs short</span></div></div>'
@@ -521,7 +541,7 @@ elif page.startswith("02"):
                 unsafe_allow_html=True)
 
     strip = "".join([
-        kpi("Sharpe Ratio", f"{sharpe:.2f}", "rf = 0", "accent", "tone-accent"),
+        kpi("Sharpe Ratio", f"{sharpe:.2f}", "excess T-bill 1m", "accent", "tone-accent"),
         kpi("Ann. Return", pct(annualized_return(r), 1), "neto", "", "tone-pos"),
         kpi("Ann. Volatility", pct(annualized_volatility(r), 1), f"target {target_vol*100:.0f}%"),
         kpi("Max Drawdown", pct(max_drawdown(r), 1), "peak-to-trough", "", "tone-neg"),
@@ -656,10 +676,8 @@ elif page.startswith("03"):
         fc.update_yaxes(type="log")
         fc.update_xaxes(range=[cum.index[0], cum.index[-1]])
         T.fig_layout(fc, PAL, height=300)
-        skipped = [k for k in CRISIS_PERIODS if k not in active_crises]
-        sub = "escala log" + (f" · fuera de ventana: {', '.join(skipped)}" if skipped else "")
         st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    f'EQUITY CURVE — CRISIS SOMBREADAS <span class="panel-sub">{sub}</span></div></div>',
+                    'EQUITY CURVE — CRISIS SOMBREADAS <span class="panel-sub">escala log</span></div></div>',
                     unsafe_allow_html=True)
         st.plotly_chart(fc, use_container_width=True, config={"displayModeBar": False})
         st.markdown('</div>', unsafe_allow_html=True)
@@ -714,23 +732,6 @@ elif page.startswith("03"):
                 "Las columnas **lookback / target_vol** son el óptimo elegido con datos hasta `train_end`: "
                 "si saltan mucho de una ventana a otra, es la huella del riesgo de sobreajuste del parámetro "
                 "(y el Sharpe OOS de al lado es lo que se logró igual, sin conocer el futuro)."
-            )
-
-        # --- OOS limpio por corte único: optimiza en el primer tramo, aplica al resto. ---
-        oos_df, oos_params, oos_split = _oos_split_cached(signal_type, weighting, data_token)
-        oos_show = oos_df.copy()
-        oos_show["Sharpe"] = oos_show["Sharpe"].round(2)
-        oos_show["Ann Ret"] = (oos_show["Ann Ret"] * 100).round(1).astype(str) + "%"
-        oos_show["Max DD"] = (oos_show["Max DD"] * 100).round(1).astype(str) + "%"
-        st.markdown(panel("IN-SAMPLE vs OUT-OF-SAMPLE", df_html(oos_show, index_label="Period"),
-                          sub=f"corte {oos_split} · optimizado solo con el in-sample"),
-                    unsafe_allow_html=True)
-        if oos_params:
-            st.caption(
-                f"Parámetros fijados con el in-sample (hasta {oos_split}): "
-                f"**lookback {oos_params['lookback']}m · target vol {oos_params['target_vol']*100:.0f}%**, "
-                "y aplicados sin cambios al out-of-sample. Que el Sharpe OOS **no se derrumbe** frente al "
-                "in-sample es la evidencia de que la estrategia no vive del sobreajuste."
             )
 
 
@@ -804,7 +805,7 @@ elif page.startswith("04"):
         """Conecta, trae portafolio/cuenta/PnL e info de conexión. Si execute_due y
         la estrategia está ACTIVA con un rebalanceo pendiente, lo ejecuta (auto-trade)."""
         from src.broker.monitor import get_live_portfolio, compute_live_pnl
-        from src.broker.orders import execute_rebalance
+        from src.broker.orders import execute_rebalance, KIND_ALLOCACION, KIND_MENSUAL
         from src.broker.market_hours import us_market_status
         auto_msg = None
         # Auto-trade solo en sesión regular: fuera de horario las órdenes no llenan bien.
@@ -813,8 +814,13 @@ elif page.startswith("04"):
             info = conn.get_connection_info()
             if execute_due and market_open and _state.is_running() and _state.rebalance_due():
                 capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
+                # Auto-trade solo dispara cuando toca por calendario: es la allocación
+                # inicial (si nunca operó) o el rebalanceo mensual. Ambos marcan el mes.
+                auto_kind = (KIND_ALLOCACION if _state.get_state().get("last_rebalance_at") is None
+                             else KIND_MENSUAL)
                 res = execute_rebalance(conn, target_weights, capital=capital,
-                                        dry_run=False, trigger="auto", params=reb_params)
+                                        dry_run=False, trigger="auto", params=reb_params,
+                                        kind=auto_kind)
                 auto_msg = (f"Auto-trade: {res['n_filled']}/{len(res['orders'])} órdenes "
                             f"llenadas con {usd(capital)}"
                             + (f" · {len(res['skipped'])} omitidas (< 1 acción)" if res["skipped"] else ""))
@@ -1025,17 +1031,23 @@ elif page.startswith("04"):
         live = st.session_state.get("live")
 
         # ===================== BLOQUE 1 · EJECUTAR ESTRATEGIA =====================
-        # Frame claro según el momento (sin jerga de "rebalanceo pendiente"):
+        # Frame claro según el momento (sin jerga de "rebalanceo pendiente"). El `kind`
+        # define si la ejecución cuenta como rebalanceo (avanza el calendario) o es solo
+        # operar (realinear drift, sin consumir el rebalanceo del mes).
+        from src.broker.orders import KIND_ALLOCACION, KIND_MENSUAL, KIND_REALINEACION
         if last_rb is None:                       # nunca operó -> allocación inicial
             exec_sub, exec_btn = "allocación inicial", "▶ Ejecutar estrategia"
+            exec_kind = KIND_ALLOCACION
             exec_note = ("La estrategia está activa pero <b>todavía no operó</b>. Al ejecutar, "
                          "compra las posiciones objetivo del modelo TSMOM con el capital de arriba.")
         elif chk.due:                             # mes nuevo -> rebalanceo del mes
             exec_sub, exec_btn = "rebalanceo del mes", "▶ Ejecutar rebalanceo del mes"
+            exec_kind = KIND_MENSUAL
             exec_note = ("Empezó un mes nuevo: ejecutá para <b>ajustar las posiciones</b> al "
                          "target TSMOM actualizado de este mes.")
-        else:                                     # ya operó este mes
+        else:                                     # ya operó este mes -> realinear (NO rebalanceo)
             exec_sub, exec_btn = f"al día · próxima {chk.next_rebalance_date}", "⟳ Rebalanceo instantáneo"
+            exec_kind = KIND_REALINEACION
             exec_note = (f"✓ Ya se ejecutó este mes (última: <b>{last_rb}</b>). La próxima "
                          f"ejecución programada es el <b>{chk.next_rebalance_date}</b>. El "
                          f"<b>rebalanceo instantáneo</b> re-alinea las posiciones al target ahora "
@@ -1073,7 +1085,8 @@ elif page.startswith("04"):
                         capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
                         res = execute_rebalance(conn, target_weights, capital=capital,
                                                 dry_run=False, trigger="dashboard",
-                                                params=reb_params, on_progress=cb)
+                                                params=reb_params, on_progress=cb,
+                                                kind=exec_kind)
                     st.session_state.pop("dry_run_res", None)
                     st.session_state["last_exec"] = {**res, "capital": capital}
                     msg = f"✓ Todo operado: {res['n_filled']}/{len(res['orders'])} órdenes llenadas"
@@ -1344,38 +1357,66 @@ elif page.startswith("05"):
 
 elif page.startswith("06"):
     st.markdown('<div class="page-h1">Rebalances <span class="dim">— historial</span></div>'
-                '<div class="page-sub">cada evento de rebalanceo y de corte ejecutado en IBKR</div>',
-                unsafe_allow_html=True)
+                '<div class="page-sub">operar ≠ rebalancear · un <b>rebalanceo</b> es el evento '
+                'mensual de calendario; el resto son <b>operaciones</b> (realineación, liquidación)'
+                '</div>', unsafe_allow_html=True)
+
+    # Etiquetas legibles de cada tipo de ejecución (kind).
+    from src.broker.orders import (KIND_ALLOCACION, KIND_MENSUAL, KIND_REALINEACION,
+                                    KIND_LIQUIDACION, KIND_TEST)
+    KIND_LABEL = {KIND_ALLOCACION: "Allocación inicial", KIND_MENSUAL: "Rebalanceo mensual",
+                  KIND_REALINEACION: "Realineación", KIND_LIQUIDACION: "Liquidación",
+                  KIND_TEST: "Test"}
+    # Un rebalanceo es LITERALMENTE el evento mes a mes (KIND_MENSUAL). Arrancar la
+    # estrategia (allocación inicial) marca el mes en el reloj —para no rebalancear de
+    # nuevo el mismo mes— pero NO es un rebalanceo: se registra como una OPERACIÓN.
+    _KINDS_REBAL = {KIND_MENSUAL}
 
     reb_path = os.path.join(ROOT, "logs", "rebalances.csv")
     reb_df = (pd.read_csv(reb_path)
               if os.path.exists(reb_path) and os.path.getsize(reb_path) > 1 else None)
     if reb_df is not None and not reb_df.empty:
         reb_df["timestamp"] = pd.to_datetime(reb_df["timestamp"])
-        n_reb = int((reb_df["trigger"] != "KILL").sum())
-        n_kill = int((reb_df["trigger"] == "KILL").sum())
+        # Compatibilidad con logs viejos (sin columna 'kind'): inferir el tipo del trigger.
+        if "kind" not in reb_df.columns:
+            reb_df["kind"] = reb_df["trigger"].map(
+                lambda t: KIND_LIQUIDACION if t == "KILL" else KIND_REALINEACION)
+        reb_df["kind"] = reb_df["kind"].fillna(KIND_REALINEACION)
+        reb_df["tipo"] = reb_df["kind"].map(lambda k: KIND_LABEL.get(k, k))
+
+        is_kill = reb_df["trigger"] == "KILL"
+        is_rebal = reb_df["kind"].isin(_KINDS_REBAL)
+        n_rebal = int(is_rebal.sum())                       # rebalanceos de verdad
+        n_ops = int((~is_kill & ~is_rebal).sum())           # operaciones (realineación, etc.)
+        n_kill = int(is_kill.sum())                         # cortes
         last = reb_df.sort_values("timestamp").iloc[-1]
         strip = "".join([
             kpi("Eventos totales", str(len(reb_df))),
-            kpi("Rebalanceos", str(n_reb), "", "", "tone-accent"),
+            kpi("Rebalanceos", str(n_rebal), "mes a mes", "", "tone-accent"),
+            kpi("Operaciones", str(n_ops), "allocación / realineación"),
             kpi("Cortes (kill)", str(n_kill), "", "", "tone-neg"),
-            kpi("Último", last["timestamp"].strftime("%Y-%m-%d %H:%M"), str(last["trigger"])),
+            kpi("Último", last["timestamp"].strftime("%Y-%m-%d %H:%M"), str(last["tipo"])),
         ])
-        st.markdown(f'<div class="kpi-strip" style="grid-template-columns:repeat(4,1fr)">{strip}</div>',
+        st.markdown(f'<div class="kpi-strip" style="grid-template-columns:repeat(5,1fr)">{strip}</div>',
                     unsafe_allow_html=True)
 
+        # Reordenar columnas para que 'tipo' quede a la vista, junto al trigger.
+        cols = ["timestamp", "rebalance_id", "tipo", "trigger", "kind"] + \
+               [c for c in reb_df.columns if c not in
+                ("timestamp", "rebalance_id", "tipo", "trigger", "kind")]
         st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
-                    'HISTORIAL DE REBALANCEOS</div></div>', unsafe_allow_html=True)
-        st.dataframe(reb_df.sort_values("timestamp", ascending=False),
+                    'HISTORIAL DE EJECUCIONES <span class="panel-sub">rebalanceos y operaciones'
+                    '</span></div></div>', unsafe_allow_html=True)
+        st.dataframe(reb_df.sort_values("timestamp", ascending=False)[cols],
                      use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # Órdenes de un rebalanceo puntual (trae trades.csv y filtra por rebalance_id)
+        # Órdenes de una ejecución puntual (trae trades.csv y filtra por rebalance_id)
         trades_path = os.path.join(ROOT, "logs", "trades.csv")
         tdf = (read_trades_csv(trades_path)
                if os.path.exists(trades_path) and os.path.getsize(trades_path) > 1 else None)
         if tdf is not None and "rebalance_id" in tdf.columns:
-                rid = st.selectbox("Ver órdenes del rebalanceo",
+                rid = st.selectbox("Ver órdenes de la ejecución",
                                    reb_df.sort_values("timestamp", ascending=False)["rebalance_id"])
                 sub = tdf[tdf["rebalance_id"] == rid]
                 st.markdown('<div class="panel"><div class="panel-head"><div class="panel-title">'
@@ -1383,7 +1424,7 @@ elif page.startswith("06"):
                 st.dataframe(sub, use_container_width=True, hide_index=True)
                 st.markdown('</div>', unsafe_allow_html=True)
     else:
-        st.markdown(panel("SIN REBALANCEOS",
-                          '<div class="mrow"><span class="mrow-k">Todavía no se ejecutó ningún '
-                          'rebalanceo. Ejecutá uno desde <b>Live Portfolio</b>.</span></div>'),
+        st.markdown(panel("SIN EJECUCIONES",
+                          '<div class="mrow"><span class="mrow-k">Todavía no se ejecutó ninguna '
+                          'operación. Ejecutá la estrategia desde <b>Live Portfolio</b>.</span></div>'),
                     unsafe_allow_html=True)

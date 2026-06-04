@@ -2,8 +2,36 @@ import pandas as pd
 import numpy as np
 
 
-def sharpe_ratio(returns: pd.Series, rf: float = 0.0) -> float:
-    excess = returns - rf / 12
+_RF_SERIES_CACHE = None  # serie cruda mensual de la T-bill 1m, memoizada por proceso
+
+
+def _default_rf_series() -> pd.Series:
+    """T-bill a 1 mes (rf mensual real) — el default del proyecto. Se carga una sola vez."""
+    global _RF_SERIES_CACHE
+    if _RF_SERIES_CACHE is None:
+        from ..data.riskfree import load_tbill_1m_raw
+        _RF_SERIES_CACHE = load_tbill_1m_raw()
+    return _RF_SERIES_CACHE
+
+
+def _excess_returns(returns: pd.Series, rf) -> pd.Series:
+    """Retorno en exceso de la tasa libre de riesgo.
+
+    rf = None   -> DEFAULT del proyecto: exceso sobre la T-bill a 1 mes (serie real,
+                   variable en el tiempo; ver src/data/riskfree.py). Operamos ETF cash
+                   fully-funded, así que el Sharpe se mide sobre el exceso (Sharpe 1994).
+    rf Series   -> tasa MENSUAL ya por-período, alineada por índice.
+    rf escalar  -> tasa ANUAL constante (se divide por 12). Solo para análisis explícito.
+    """
+    if rf is None:
+        rf = _default_rf_series()
+    if isinstance(rf, pd.Series):
+        return returns - rf.reindex(returns.index).ffill().bfill()
+    return returns - rf / 12
+
+
+def sharpe_ratio(returns: pd.Series, rf=None) -> float:
+    excess = _excess_returns(returns, rf)
     if excess.std() == 0:
         return np.nan
     return float((excess.mean() / excess.std()) * np.sqrt(12))
@@ -35,8 +63,8 @@ def calmar_ratio(returns: pd.Series) -> float:
     return ann_ret / mdd
 
 
-def sortino_ratio(returns: pd.Series, rf: float = 0.0) -> float:
-    excess = returns - rf / 12
+def sortino_ratio(returns: pd.Series, rf=None) -> float:
+    excess = _excess_returns(returns, rf)
     downside = excess[excess < 0].std()
     if downside == 0:
         return np.nan

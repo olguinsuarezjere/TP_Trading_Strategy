@@ -15,6 +15,7 @@ from datetime import date
 import pandas as pd
 
 from . import state
+from . import orders as orders_mod
 from .ibkr import IBKRConnection
 from .orders import execute_rebalance
 
@@ -114,11 +115,19 @@ def run_tick(
         "lookback": config["strategy"].get("lookback_months"),
         "target_vol": config["strategy"].get("target_volatility"),
     }
+    # QUÉ tipo de ejecución es: si toca por calendario es un rebalanceo (mensual, o la
+    # allocación inicial si nunca operó); si es forzado fuera de calendario, es una
+    # realineación ad-hoc que NO consume el rebalanceo del mes.
+    if chk.due:
+        kind = orders_mod.KIND_ALLOCACION if chk.last_rebalance_at is None else orders_mod.KIND_MENSUAL
+    else:
+        kind = orders_mod.KIND_REALINEACION
     res = execute_rebalance(conn, target, capital=capital, dry_run=False,
-                            trigger=trigger, params=params)
+                            trigger=trigger, params=params, kind=kind)
     orders = res["orders"]
-    # execute_rebalance ya registró el rebalanceo en el estado (state.record_rebalance).
-    rid = state.get_state().get("last_rebalance_id")
+    # El id viene del resultado (no del estado): una realineación no marca el reloj,
+    # así que state.last_rebalance_id podría ser de otro evento.
+    rid = res["rebalance_id"]
     msg = (f"Rebalanceo ejecutado: {res['n_filled']}/{len(orders)} llenadas"
            + (f", {len(res['skipped'])} omitidas (< 1 acción)" if res["skipped"] else ""))
     return TickResult(True, orders=orders, rebalance_id=rid, message=msg)

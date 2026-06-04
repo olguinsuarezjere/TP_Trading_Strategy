@@ -29,8 +29,25 @@ NAV_LOG = os.path.join(_LOG_DIR, "nav_history.csv")
 
 TRADE_HEADER = ["timestamp", "rebalance_id", "ticker", "action", "qty",
                 "order_type", "limit_price", "fill_price", "status", "reason"]
-REBAL_HEADER = ["timestamp", "rebalance_id", "trigger", "signal_mode", "lookback",
+REBAL_HEADER = ["timestamp", "rebalance_id", "trigger", "kind", "signal_mode", "lookback",
                 "target_vol", "capital", "n_orders", "gross_notional", "status"]
+
+# Tipos de ejecución. Operar (mandar órdenes) y rebalancear (el evento mensual de
+# calendario) son cosas distintas: TODA ejecución pasa por execute_rebalance, pero
+# solo el rebalanceo mensual —y la allocación inicial, que también deja el mes al día—
+# avanzan el reloj mensual (state.record_rebalance). Una realineación de drift, una
+# liquidación o un test NO consumen el rebalanceo del mes.
+KIND_ALLOCACION = "allocacion_inicial"   # primera compra al target (deja el mes al día)
+KIND_MENSUAL    = "rebalanceo_mensual"   # el rebalanceo de calendario (mes nuevo)
+KIND_REALINEACION = "realineacion"       # re-alinear drift ad-hoc (NO consume el mes)
+KIND_LIQUIDACION  = "liquidacion"        # cerrar/vender posiciones (NO consume el mes)
+KIND_TEST         = "test"               # operación de prueba (NO consume el mes)
+
+# Tipos que CONSUMEN el slot del mes (avanzan el reloj para no operar de nuevo el mismo
+# mes). Ojo: esto es distinto de "ser un rebalanceo". La allocación inicial marca el mes
+# (no querés rebalancear el mismo mes que arrancaste) pero NO es un rebalanceo —en el
+# registro/dashboard cuenta como OPERACIÓN. El único rebalanceo de verdad es el mensual.
+_KINDS_QUE_MARCAN_MES = {KIND_ALLOCACION, KIND_MENSUAL}
 NAV_HEADER = ["timestamp", "invested", "pnl", "ret_pct", "drift"]
 
 
@@ -159,12 +176,13 @@ def _log_trade(rebalance_id: str, ticker: str, action: str, qty: float, order_ty
 
 
 def _log_rebalance(rebalance_id: str, trigger: str, n_orders: int, gross_notional: float,
-                   capital: float, status: str, params: dict | None = None) -> None:
+                   capital: float, status: str, kind: str = KIND_REALINEACION,
+                   params: dict | None = None) -> None:
     _init_log(REBALANCES_LOG, REBAL_HEADER)
     params = params or {}
     with open(REBALANCES_LOG, "a", newline="") as f:
         csv.writer(f).writerow([
-            datetime.now().isoformat(timespec="seconds"), rebalance_id, trigger,
+            datetime.now().isoformat(timespec="seconds"), rebalance_id, trigger, kind,
             params.get("signal_mode", ""), params.get("lookback", ""),
             params.get("target_vol", ""), round(capital, 2), n_orders,
             round(gross_notional, 2), status,
@@ -326,6 +344,7 @@ def execute_rebalance(
     trigger: str = "manual",
     params: dict | None = None,
     on_progress=None,
+    kind: str = KIND_REALINEACION,
 ) -> dict:
     """
     Computa las órdenes necesarias para alcanzar target_weights y las ejecuta.
@@ -334,6 +353,10 @@ def execute_rebalance(
     capital: valor total del portafolio en USD
     dry_run: si True, solo computa las órdenes sin ejecutarlas ni registrarlas
     trigger: origen del rebalanceo (ej. "manual", "dashboard") — para el log
+    kind: QUÉ tipo de ejecución es (ver KIND_*). Distingue OPERAR de REBALANCEAR:
+          solo allocación inicial y rebalanceo mensual avanzan el reloj mensual; una
+          realineación / liquidación / test NO consumen el rebalanceo del mes. Default
+          conservador = realineacion (no marca el mes) para no pisar el calendario.
     on_progress(msg): callback opcional para reportar el avance a la UI.
 
     Devuelve un dict: {orders, skipped, n_filled, n_pending, gross_notional, rebalance_id}.
@@ -422,9 +445,12 @@ def execute_rebalance(
 
     if not dry_run and orders:
         _log_rebalance(rebalance_id, trigger, len(orders), gross_notional, capital,
-                       status="executed", params=params)
-        # Marca el estado: el guard mensual y el catch-up al reconectar leen esto.
-        state.record_rebalance(rebalance_id)
+                       status="executed", kind=kind, params=params)
+        # Avanzar el reloj mensual SOLO si esta ejecución es realmente un rebalanceo
+        # (mensual o allocación inicial). Operar por otro motivo —realinear drift,
+        # liquidar, un test— NO debe marcar el mes como rebalanceado: operar ≠ rebalancear.
+        if kind in _KINDS_QUE_MARCAN_MES:
+            state.record_rebalance(rebalance_id)
         _p(f"✓ Listo: {n_filled}/{len(orders)} órdenes llenadas"
            + (f" · {n_pending} sin confirmar" if n_pending else " · nada pendiente"))
     return {"orders": orders, "skipped": skipped, "n_filled": n_filled,
@@ -479,7 +505,8 @@ def close_all_positions(
         if closeable:
             _place_orders_batch(conn, closeable, rebalance_id, reason=reason)
         _log_rebalance(rebalance_id, trigger="KILL", n_orders=len(closeable),
-                       gross_notional=0.0, capital=0.0, status="executed")
+                       gross_notional=0.0, capital=0.0, status="executed",
+                       kind=KIND_LIQUIDACION)
     else:
         for o in closeable:
             print(f"  {o['action']:4} {o['qty']:>6g} {o['ticker']:6} [{o['secType']}]  [cerrar]")

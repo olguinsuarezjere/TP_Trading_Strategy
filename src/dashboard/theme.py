@@ -94,8 +94,13 @@ html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
 
 /* ---- sidebar como rail terminal ---- */
 section[data-testid="stSidebar"] { background: var(--bg-1) !important; border-right:1px solid var(--border); width:230px !important; }
-section[data-testid="stSidebar"] > div { padding-top: 0.6rem; }
+section[data-testid="stSidebar"] > div { padding-top: 0.2rem; }
+section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding-top: 0; }
 section[data-testid="stSidebar"] * { font-family: var(--mono) !important; }
+.side-team { display:flex; flex-direction:column; gap:2px; padding:0 2px 3px; margin:2rem 0 9px;
+             border-bottom:1px solid var(--border-soft); }
+.side-team-label { color:var(--text-faint); font-size:8px; letter-spacing:2.5px; text-transform:uppercase; }
+.side-team > span:last-child { color:var(--text-dim); font-size:9.5px; line-height:1.45; letter-spacing:.2px; }
 .side-head { display:flex; align-items:center; gap:10px; padding:2px 2px 11px; border-bottom:1px solid var(--border); margin-bottom:10px;}
 .side-logo { width:30px;height:30px;border:1px solid var(--accent);display:flex;align-items:center;justify-content:center;
              color:var(--accent);font-weight:700;text-shadow:0 0 10px var(--accent-glow);}
@@ -184,6 +189,10 @@ section[data-testid="stSidebar"] label p { color:var(--text-dim); font-size:11px
            width:236px; max-width:74vw; padding:10px 12px;
            background:var(--bg-1); border:1px solid var(--border); border-radius:4px;
            box-shadow:0 8px 26px rgba(0,0,0,.5); color:var(--text); }
+@media (prefers-reduced-motion: no-preference) {
+  .sigcell[open] .sig-pop { animation: sigPopIn .12s ease-out; }
+}
+@keyframes sigPopIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
 .sig-pop-name { font-size:11.5px; font-weight:700; line-height:1.25; color:var(--text); }
 .sig-pop-desc { font-size:10.5px; line-height:1.45; color:var(--text-dim); margin-top:4px; }
 .sig-pop-metrics { display:flex; gap:14px; margin-top:9px; padding-top:8px; border-top:1px solid var(--border-soft); }
