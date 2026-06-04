@@ -3,7 +3,7 @@
 **Ingeniería Financiera F414 — Universidad de San Andrés (2026)**
 
 Sistema de trading cuantitativo basado en la estrategia **Time Series Momentum (TSMOM)**
-sobre un universo de 66 ETFs (equities, bonds, commodities, currencies).
+sobre un universo de 133 ETFs (curados de 205 por liquidez; equities, bonds, commodities, currencies).
 
 ---
 
@@ -48,7 +48,7 @@ python main.py --help
 ├── main.py                  # CLI (Click)
 ├── config.yaml              # Parámetros centrales
 ├── requirements.txt
-├── project_walkthrough.ipynb  # Documentación completa del proyecto
+├── TP_walkthrough.ipynb     # Documentación completa del proyecto (notebook único)
 ├── Data/
 │   └── etf_prices.parquet   # Precios históricos (2012–hoy)
 ├── src/
@@ -57,7 +57,7 @@ python main.py --help
 │   ├── backtest/            # Engine, costos y métricas
 │   ├── robustness/          # Sensibilidad, stress, OOS
 │   ├── broker/              # Integración IBKR (ib_insync)
-│   └── dashboard/           # App Streamlit (5 páginas)
+│   └── dashboard/           # App Streamlit (6 páginas)
 └── logs/
     └── trades.csv           # Log de operaciones
 ```

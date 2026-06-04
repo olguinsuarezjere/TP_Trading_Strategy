@@ -332,7 +332,7 @@ with st.sidebar:
     # Señal y ponderación van primero: el óptimo de (lookback, target vol) depende de ellas.
     # 'multihorizon' (Baz et al. 2015) quedó FUERA de las opciones operables: su esquema está
     # pensado para tendencias rápidas con datos diarios y rinde peor en nuestro rebalanceo mensual
-    # sobre ETF (ver justificación en dashboard_walkthrough.ipynb). El código sigue disponible en
+    # sobre ETF (ver justificación en TP_walkthrough.ipynb). El código sigue disponible en
     # src/strategy/signals.py por si se quisiera retomar.
     signal_type = st.radio("Señal", ["strength", "binary"], horizontal=True)
     weighting = st.radio("Ponderación", ["pooled", "class_balanced"], horizontal=True)

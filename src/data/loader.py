@@ -3,6 +3,9 @@ import numpy as np
 from pathlib import Path
 from .universe import ETF_UNIVERSE, REDUNDANT_TICKERS, EXCLUDED_TICKERS
 
+# "ME" (Month End) se introdujo en pandas 2.2; versiones anteriores usan "M"
+_MONTH_END = "ME" if pd.__version__ >= "2.2" else "M"
+
 
 def load_etf_prices(path: str) -> pd.DataFrame:
     df = pd.read_parquet(path)
@@ -58,7 +61,7 @@ def update_prices(path: str, tickers: list[str] | None = None, start: str = "201
 
 
 def compute_monthly_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    monthly = prices.resample("ME").last().ffill()
+    monthly = prices.resample(_MONTH_END).last().ffill()
     returns = monthly.pct_change().dropna(how="all")
     # Keep only tickers present in our universe
     known = [c for c in returns.columns if c in ETF_UNIVERSE]
