@@ -48,6 +48,18 @@ KIND_TEST         = "test"               # operación de prueba (NO consume el m
 # (no querés rebalancear el mismo mes que arrancaste) pero NO es un rebalanceo —en el
 # registro/dashboard cuenta como OPERACIÓN. El único rebalanceo de verdad es el mensual.
 _KINDS_QUE_MARCAN_MES = {KIND_ALLOCACION, KIND_MENSUAL}
+
+# Motivo legible de cada orden (columna `reason` en trades.csv), derivado del kind. Antes
+# estaba hardcodeado "rebalance" para TODA ejecución → las órdenes de la allocación inicial
+# aparecían como "rebalance" (misma confusión operar/rebalancear). Ahora se diferencia.
+KIND_REASON = {
+    KIND_ALLOCACION:   "allocacion inicial",
+    KIND_MENSUAL:      "rebalanceo mensual",
+    KIND_REALINEACION: "realineacion",
+    KIND_LIQUIDACION:  "liquidacion",
+    KIND_TEST:         "test",
+}
+
 NAV_HEADER = ["timestamp", "invested", "pnl", "ret_pct", "drift"]
 
 
@@ -437,7 +449,8 @@ def execute_rebalance(
     n_filled = n_pending = 0
     if not dry_run and orders:
         _, n_filled, n_pending = _place_orders_batch(
-            conn, orders, rebalance_id, reason="rebalance", on_progress=on_progress)
+            conn, orders, rebalance_id, reason=KIND_REASON.get(kind, kind),
+            on_progress=on_progress)
 
     gross_notional = sum(abs(o["qty"] * o["price"]) for o in orders)
     print(f"{'-'*55}")

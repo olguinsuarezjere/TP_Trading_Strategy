@@ -250,7 +250,7 @@ class IBKRConnection:
         ]
         return pd.DataFrame(rows, columns=["ticker", "qty", "avg_cost"])
 
-    def get_portfolio_fast(self, settle: float = 2.0) -> pd.DataFrame:
+    def get_portfolio_fast(self, settle: float = 2.0, load_timeout: float = 8.0) -> pd.DataFrame:
         """Portafolio completo (precio, valor de mercado, P&L) en UNA sola llamada.
 
         Usa `ib.portfolio()` (viene del stream de actualizaciones de cuenta de TWS),
@@ -265,11 +265,42 @@ class IBKRConnection:
 
         Espera ADAPTATIVA: en vez de dormir `settle` fijo, espera solo hasta que lleguen
         los datos de cuenta (señal de que el download terminó), con ese tope. Como
-        connect() ya sincroniza la cuenta, normalmente sale al instante."""
+        connect() ya sincroniza la cuenta, normalmente sale al instante.
+
+        Espera de COMPLETITUD (clave tras operar): el stream de cuenta entrega las
+        posiciones de a poco. Si valuamos a mitad de carga, el market value sale
+        INCOMPLETO y el P&L (= market value − net_deployed) muestra un valor falso —el
+        "-25.000" fantasma que se corrige solo en el refresh siguiente—. reqPositions()
+        da el set COMPLETO y confiable; esperamos a que portfolio() (que trae el market
+        value) cubra a TODAS esas posiciones con precio, o hasta `load_timeout`."""
         waited = 0.0
         while waited < settle and not self.ib.accountValues():
             self.ib.sleep(0.2)
             waited += 0.2
+
+        # 1) Set completo de posiciones esperadas (esperar a que reqPositions se estabilice).
+        self.ib.reqPositions()
+        prev_n, t = -1, 0.0
+        while t < 3.0:
+            self.ib.sleep(0.3); t += 0.3
+            n = sum(1 for p in self.ib.positions() if abs(p.position) > 1e-9)
+            if n == prev_n:            # dos lecturas iguales -> estable
+                break
+            prev_n = n
+        expected = {p.contract.conId for p in self.ib.positions() if abs(p.position) > 1e-9}
+
+        # 2) Esperar a que el stream de portfolio cubra todas esas posiciones CON precio
+        #    (market value no nulo). Si una posición no se puede valuar (sin datos), el
+        #    tope evita colgarse y devuelve lo mejor disponible.
+        if expected:
+            t = 0.0
+            while t < load_timeout:
+                priced = {it.contract.conId for it in self.ib.portfolio()
+                          if abs(it.position) > 1e-9 and it.marketValue}
+                if expected <= priced:
+                    break
+                self.ib.sleep(0.3); t += 0.3
+
         rows = []
         for it in self.ib.portfolio():
             if abs(it.position) < 1e-9:

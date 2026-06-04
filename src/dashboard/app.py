@@ -842,11 +842,15 @@ elif page.startswith("04"):
             _state.set_net_deployed(net_dep)
         cum_pnl = signed_mv - net_dep
         # Drift total actual (fracción del portafolio a reasignar para volver al target).
-        _tgt_pct = target_weights / (float(target_weights.abs().sum()) or 1.0)
-        _curw = ((_sdf.groupby("ticker")["market_value"].sum() / invested)
-                 if (not _sdf.empty and invested) else pd.Series(dtype=float))
-        drift_total = float(sum(abs(float(_tgt_pct.get(k, 0.0)) - float(_curw.get(k, 0.0)))
-                                for k in _tgt_pct.index.union(_curw.index))) / 2
+        # Solo tiene sentido si HAY posiciones: con la cartera flat (cerrada / pre-allocación)
+        # no hay nada desviado → drift 0. Si no, comparar daría ½·Σ|target| = 50% (artefacto).
+        if not _sdf.empty and invested:
+            _tgt_pct = target_weights / (float(target_weights.abs().sum()) or 1.0)
+            _curw = _sdf.groupby("ticker")["market_value"].sum() / invested
+            drift_total = float(sum(abs(float(_tgt_pct.get(k, 0.0)) - float(_curw.get(k, 0.0)))
+                                    for k in _tgt_pct.index.union(_curw.index))) / 2
+        else:
+            drift_total = 0.0
         st.session_state["live"] = {"account": account, "portfolio": portfolio_df,
                                     "pnl": pnl, "info": info, "invested": invested,
                                     "cum_pnl": cum_pnl, "drift_total": drift_total,
@@ -1075,28 +1079,66 @@ elif page.startswith("04"):
                        f"deshabilitado: fuera de la sesión regular las órdenes no llenan "
                        f"bien y dejarían el portafolio inconsistente. Próxima sesión: "
                        f"{mk['next_open_local']} (tu hora).")
-        elif ec2.button(exec_btn, type="primary"):
-            from src.broker.orders import execute_rebalance
-            # Panel de progreso en vivo: cada mensaje del backend se escribe acá.
-            with st.status("Ejecutando operaciones…", expanded=True) as status_box:
+        else:
+            clicked = ec2.button(exec_btn, type="primary")
+            # El rebalanceo INSTANTÁNEO (realineación) opera FUERA del calendario: pedimos
+            # confirmación con un panel (estilo popover de Overview) antes de operar. La
+            # allocación inicial y el rebalanceo del mes se ejecutan directo.
+            if clicked and exec_kind == KIND_REALINEACION:
+                st.session_state["confirm_realign"] = True
+                clicked = False
+            do_exec = clicked
+            if st.session_state.get("confirm_realign"):
+                from datetime import date as _date
                 try:
-                    cb = lambda m: status_box.write(f"• {m}")
-                    with ibkr_session(config, "rebalance") as conn:
-                        capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
-                        res = execute_rebalance(conn, target_weights, capital=capital,
-                                                dry_run=False, trigger="dashboard",
-                                                params=reb_params, on_progress=cb,
-                                                kind=exec_kind)
-                    st.session_state.pop("dry_run_res", None)
-                    st.session_state["last_exec"] = {**res, "capital": capital}
-                    msg = f"✓ Todo operado: {res['n_filled']}/{len(res['orders'])} órdenes llenadas"
-                    if res["n_pending"]:
-                        msg += f" · {res['n_pending']} sin confirmar (revisá en unos seg)"
-                    status_box.update(label=msg, state="complete", expanded=False)
-                    _fetch_live()
+                    _nd = _date.fromisoformat(str(chk.next_rebalance_date))
+                    _dias = (_nd - _date.today()).days
+                    _fecha_txt = _nd.strftime("%d/%m/%Y")
+                except Exception:
+                    _dias, _fecha_txt = None, str(chk.next_rebalance_date)
+                _dias_txt = ("" if _dias is None else
+                             (f" (en {_dias} día{'s' if _dias != 1 else ''})" if _dias > 0
+                              else " (hoy mismo)"))
+                st.markdown(
+                    f'<div style="background:var(--bg-1);border:1px solid var(--accent);'
+                    f'border-radius:6px;padding:14px 16px;box-shadow:0 8px 26px rgba(0,0,0,.5);'
+                    f'margin:6px 0 10px">'
+                    f'<div style="font-size:15px;font-weight:700;color:var(--text)">'
+                    f'¿Seguro que querés rebalancear ahora?</div>'
+                    f'<div style="font-size:12px;line-height:1.5;color:var(--text-dim);margin-top:6px">'
+                    f'Esto es un <b style="color:var(--text)">rebalanceo instantáneo</b>, fuera del '
+                    f'calendario. Tu próximo rebalanceo ya está <b style="color:var(--text)">programado '
+                    f'para el {_fecha_txt}</b>{_dias_txt}. Re-alinea las posiciones al target ahora; '
+                    f'no consume el rebalanceo del mes.</div></div>', unsafe_allow_html=True)
+                cfa, cfb = st.columns(2)
+                if cfa.button("✓ Sí, rebalancear ahora", type="primary", key="confirm_realign_yes"):
+                    st.session_state.pop("confirm_realign", None)
+                    do_exec = True
+                if cfb.button("Cancelar", key="confirm_realign_no"):
+                    st.session_state.pop("confirm_realign", None)
                     st.rerun()
-                except Exception as e:
-                    status_box.update(label=f"Error al ejecutar: {e}", state="error")
+            if do_exec:
+                from src.broker.orders import execute_rebalance
+                # Panel de progreso en vivo: cada mensaje del backend se escribe acá.
+                with st.status("Ejecutando operaciones…", expanded=True) as status_box:
+                    try:
+                        cb = lambda m: status_box.write(f"• {m}")
+                        with ibkr_session(config, "rebalance") as conn:
+                            capital = _deploy_capital(conn.get_account_summary().get("NetLiquidation", 1_000_000))
+                            res = execute_rebalance(conn, target_weights, capital=capital,
+                                                    dry_run=False, trigger="dashboard",
+                                                    params=reb_params, on_progress=cb,
+                                                    kind=exec_kind)
+                        st.session_state.pop("dry_run_res", None)
+                        st.session_state["last_exec"] = {**res, "capital": capital}
+                        msg = f"✓ Todo operado: {res['n_filled']}/{len(res['orders'])} órdenes llenadas"
+                        if res["n_pending"]:
+                            msg += f" · {res['n_pending']} sin confirmar (revisá en unos seg)"
+                        status_box.update(label=msg, state="complete", expanded=False)
+                        _fetch_live()
+                        st.rerun()
+                    except Exception as e:
+                        status_box.update(label=f"Error al ejecutar: {e}", state="error")
 
         # Resumen de la última ejecución (incluye las órdenes omitidas por < 1 acción).
         le = st.session_state.get("last_exec")
@@ -1230,44 +1272,52 @@ elif page.startswith("04"):
             else:
                 st.info("La estrategia no tiene posiciones abiertas todavía.")
 
-            # Drift: solo tickers de la estrategia (groupby por si hay varios lotes).
-            # Normalizamos el target al mismo gross (% de la estrategia) para que sea
-            # comparable con el peso actual: así, recién ejecutada, el drift es ~0.
-            cur_w = (strat_df.groupby("ticker")["weight"].sum() if not strat_df.empty
-                     else pd.Series(dtype=float))
-            _tgt_gross = float(target_weights.abs().sum()) or 1.0
-            target_pct = target_weights / _tgt_gross
-            drift_rows = []
-            for tk in target_pct.index.union(cur_w.index):
-                tw = float(target_pct.get(tk, 0.0))
-                cw = float(cur_w.get(tk, 0.0))
-                drift_rows.append({"ticker": tk, "asset_class": ETF_UNIVERSE.get(tk, "—"),
-                                   "target_w": round(tw, 4), "current_w": round(cw, 4),
-                                   "drift": round(tw - cw, 4)})
-            drift_df = pd.DataFrame(drift_rows)
-            drift_df["abs"] = drift_df["drift"].abs()
-            drift_df = drift_df.sort_values("abs", ascending=False).drop(columns="abs")
-            # Drift total = mitad de la suma de |drift| = fracción del portafolio que
-            # habría que reasignar para volver al target (turnover de un rebalanceo).
-            # Se recalcula en CADA refresh (cambia con los precios en vivo).
-            drift_total = float(drift_df["drift"].abs().sum()) / 2
-            # Sparkline del historial de drift (se mueve cuando el drift cambia).
-            spark = ""
-            if os.path.exists(nav_path) and os.path.getsize(nav_path) > 1:
-                _navd = pd.read_csv(nav_path)
-                if "drift" in _navd.columns and _navd["drift"].notna().sum() >= 2:
-                    spark = sparkline((_navd["drift"].dropna() * 100).tail(50).tolist(),
-                                      PAL["accent"], width=200, height=34)
-            st.markdown(
-                f'<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:2px 0">'
-                f'<span style="font-size:1.3rem;font-weight:700;color:var(--accent);'
-                f'font-family:\'JetBrains Mono\',monospace">Drift total: {pct(drift_total, 1)}</span>'
-                f'<span class="panel-sub">actualizado {live["ts"]} · se recalcula en cada refresh</span>'
-                f'<span style="flex:1;min-width:120px">{spark}</span></div>',
-                unsafe_allow_html=True)
-            st.caption("Cuánto del portafolio habría que reasignar para volver al target · "
-                       "top 8 posiciones más desviadas:")
-            st.dataframe(drift_df.head(8), use_container_width=True, hide_index=True)
+            # Drift: solo tiene sentido con POSICIONES abiertas. Con la cartera flat
+            # (recién cerrada con el kill, o antes de la allocación inicial) no hay nada
+            # desviado del target → drift 0. Mostrar ½·Σ|target| = 50% sería un artefacto.
+            if strat_df.empty or not invested:
+                st.markdown(
+                    '<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:2px 0">'
+                    '<span style="font-size:1.3rem;font-weight:700;color:var(--text-dim);'
+                    'font-family:\'JetBrains Mono\',monospace">Drift total: 0.0%</span>'
+                    '<span class="panel-sub">sin posiciones abiertas — no hay nada que reasignar</span>'
+                    '</div>', unsafe_allow_html=True)
+            else:
+                # Normalizamos el target al gross de la estrategia para comparar con el peso
+                # actual: así, recién ejecutada, el drift es ~0.
+                cur_w = strat_df.groupby("ticker")["weight"].sum()
+                _tgt_gross = float(target_weights.abs().sum()) or 1.0
+                target_pct = target_weights / _tgt_gross
+                drift_rows = []
+                for tk in target_pct.index.union(cur_w.index):
+                    tw = float(target_pct.get(tk, 0.0))
+                    cw = float(cur_w.get(tk, 0.0))
+                    drift_rows.append({"ticker": tk, "asset_class": ETF_UNIVERSE.get(tk, "—"),
+                                       "target_w": round(tw, 4), "current_w": round(cw, 4),
+                                       "drift": round(tw - cw, 4)})
+                drift_df = pd.DataFrame(drift_rows)
+                drift_df["abs"] = drift_df["drift"].abs()
+                drift_df = drift_df.sort_values("abs", ascending=False).drop(columns="abs")
+                # Drift total = mitad de la suma de |drift| = fracción del portafolio que
+                # habría que reasignar para volver al target (turnover de un rebalanceo).
+                drift_total = float(drift_df["drift"].abs().sum()) / 2
+                # Sparkline del historial de drift (se mueve cuando el drift cambia).
+                spark = ""
+                if os.path.exists(nav_path) and os.path.getsize(nav_path) > 1:
+                    _navd = pd.read_csv(nav_path)
+                    if "drift" in _navd.columns and _navd["drift"].notna().sum() >= 2:
+                        spark = sparkline((_navd["drift"].dropna() * 100).tail(50).tolist(),
+                                          PAL["accent"], width=200, height=34)
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:2px 0">'
+                    f'<span style="font-size:1.3rem;font-weight:700;color:var(--accent);'
+                    f'font-family:\'JetBrains Mono\',monospace">Drift total: {pct(drift_total, 1)}</span>'
+                    f'<span class="panel-sub">actualizado {live["ts"]} · se recalcula en cada refresh</span>'
+                    f'<span style="flex:1;min-width:120px">{spark}</span></div>',
+                    unsafe_allow_html=True)
+                st.caption("Cuánto del portafolio habría que reasignar para volver al target · "
+                           "top 8 posiciones más desviadas:")
+                st.dataframe(drift_df.head(8), use_container_width=True, hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
         # ----- KILL SWITCH / RESET (siempre disponible si la estrategia está enrolada) -----
