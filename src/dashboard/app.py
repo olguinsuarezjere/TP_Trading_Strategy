@@ -603,10 +603,9 @@ elif page.startswith("03"):
     with tab1:
         c1, c2 = st.columns(2)
         with c1:
-            # Grilla que SIEMPRE incluye el lookback en uso (= óptimo por defecto), así el
-            # gráfico muestra la barra del parámetro operado y no uno cercano. Esa barra va
-            # resaltada (warn) para distinguir el punto de operación del resto.
-            lb_grid = sorted(set([3, 6, 9, 12, 15, 18, 21, 24, lookback]))
+            # TODOS los meses 3..24 (no de a 3): así cada lookback tiene su barra y no
+            # quedan huecos que parezcan "Sharpe 0". El lookback en uso va resaltado (warn).
+            lb_grid = list(range(3, 25))
             lb_df = lookback_sensitivity(returns, config, lookbacks=lb_grid)
             lb_colors = [PAL["warn"] if i == lookback else (PAL["accent"] if v >= 0 else PAL["neg"])
                          for i, v in zip(lb_df.index, lb_df["sharpe"])]
